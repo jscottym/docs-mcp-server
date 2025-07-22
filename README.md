@@ -345,7 +345,8 @@ Deploy the Docs MCP Server on [Railway](https://railway.app) with persistent vol
 The Railway deployment uses `Dockerfile.railway` which is optimized for Railway's volume system. Key differences from the standard Dockerfile:
 
 - ✅ **No VOLUME directive** (Railway doesn't support it)
-- ✅ **Uses `/app/data` mount path** for Railway volumes
+- ✅ **Uses `/app/data` mount path** for Railway volumes  
+- ✅ **Runs web interface by default** on Railway's assigned `PORT`
 - ✅ **Pre-configured environment variables** for Railway
 
 ### Environment Variables for Railway

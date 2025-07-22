@@ -87,10 +87,10 @@ railway volume add --mount-path /app/data --size 5
 
 ## Service Configuration
 
-The Railway deployment runs both the MCP server and web interface in a single container. You can access:
+The Railway deployment runs the **web interface** by default on Railway's assigned port. You can access:
 
-- **MCP Server**: Available on the Railway-assigned port (environment variable `PORT`)
-- **Web Interface**: Available at your Railway app URL
+- **Web Interface**: Available at your Railway app URL (uses `PORT` environment variable)
+- **MCP Server**: For MCP access, you would need to deploy a separate Railway service with MCP-specific configuration
 
 ## Custom Domains
 
@@ -113,9 +113,16 @@ Monitor your deployment:
 
 ### Common Issues
 
-1. **Volume mounting errors**: Ensure the volume is mounted to `/app/data`
-2. **Environment variables**: Verify `OPENAI_API_KEY` is set
-3. **Build failures**: Check that `Dockerfile.railway` is being used
+1. **502 Bad Gateway / Application failed to respond**: 
+   - Ensure you're using `Dockerfile.railway` (not the standard Dockerfile)
+   - The Railway Dockerfile runs the web interface on Railway's assigned `PORT`
+   - Redeploy if you recently switched Dockerfiles
+
+2. **Volume mounting errors**: Ensure the volume is mounted to `/app/data`
+
+3. **Environment variables**: Verify `OPENAI_API_KEY` is set
+
+4. **Build failures**: Check that `Dockerfile.railway` is being used in Railway settings
 
 ### Getting Help
 

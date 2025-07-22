@@ -50,9 +50,8 @@ RUN mkdir -p /app/data && chmod 777 /app/data
 # Set data directory for Railway volume mounting
 ENV DOCS_MCP_STORE_PATH=/app/data
 
-# Expose the ports the applications listen on
-EXPOSE 6280
-EXPOSE 6281
+# Expose the port (Railway will set PORT env var)
+EXPOSE $PORT
 
-# Set the command to run the application
-ENTRYPOINT ["node", "dist/index.js"] 
+# Set the command to run the web interface using Railway's PORT
+ENTRYPOINT ["sh", "-c", "node dist/index.js web --port ${PORT:-6281}"] 
