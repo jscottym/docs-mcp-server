@@ -315,6 +315,56 @@ For command help, run:
 npx @arabold/docs-mcp-server@latest --help
 ```
 
+## Railway Deployment
+
+Deploy the Docs MCP Server on [Railway](https://railway.app) with persistent volume storage:
+
+### Quick Deploy
+
+1. **Fork this repository**
+2. **Connect to Railway:**
+   ```bash
+   railway login
+   railway init
+   ```
+3. **Add a volume for persistent storage:**
+   ```bash
+   railway volume add --mount-path /app/data
+   ```
+4. **Set environment variables:**
+   ```bash
+   railway variables set OPENAI_API_KEY=your_openai_api_key_here
+   ```
+5. **Deploy:**
+   ```bash
+   railway up
+   ```
+
+### Configuration
+
+The Railway deployment uses `Dockerfile.railway` which is optimized for Railway's volume system. Key differences from the standard Dockerfile:
+
+- ✅ **No VOLUME directive** (Railway doesn't support it)
+- ✅ **Uses `/app/data` mount path** for Railway volumes
+- ✅ **Pre-configured environment variables** for Railway
+
+### Environment Variables for Railway
+
+Set these variables in your Railway project:
+
+- **Required:** `OPENAI_API_KEY`
+- **Optional:** See `.env.example` for all supported options
+
+### Benefits of Railway Deployment
+
+- 🚀 **Easy deployment** with automatic builds
+- 💾 **Persistent storage** via Railway volumes
+- 📊 **Built-in monitoring** and logs
+- 🔒 **Automatic HTTPS** and custom domains
+- 💰 **Usage-based pricing** with sleep mode
+
+For detailed Railway deployment instructions, see [deploy-railway.md](deploy-railway.md).
+
 ## Configuration
 
 The Docs MCP Server is configured via environment variables. Set these in your shell, Docker, or MCP client config.

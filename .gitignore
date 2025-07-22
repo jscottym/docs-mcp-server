@@ -4,5 +4,4 @@ dist/
 public/assets/
 *.log
 .env*
-!*.env.example
 *.code-workspace
