@@ -87,10 +87,10 @@ railway volume add --mount-path /app/data --size 5
 
 ## Service Configuration
 
-The Railway deployment runs the **web interface** by default on Railway's assigned port. You can access:
+The Railway deployment runs the **MCP server** by default on Railway's assigned port. You can access:
 
-- **Web Interface**: Available at your Railway app URL (uses `PORT` environment variable)
-- **MCP Server**: For MCP access, you would need to deploy a separate Railway service with MCP-specific configuration
+- **MCP Server**: Available at your Railway app URL with `/sse` endpoint (uses `PORT` environment variable)
+- **Web Interface**: For web UI access, you would need to deploy a separate Railway service or modify the Dockerfile to run the web interface instead
 
 ## Custom Domains
 
