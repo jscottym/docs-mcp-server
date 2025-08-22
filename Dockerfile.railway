@@ -53,5 +53,5 @@ ENV DOCS_MCP_STORE_PATH=/app/data
 # Expose the port (Railway will set PORT env var)
 EXPOSE $PORT
 
-# Set the command to run the MCP server with HTTP protocol using Railway's PORT
+# Set the command to run the unified server using Railway's PORT
 ENTRYPOINT ["sh", "-c", "node dist/index.js --protocol http --port ${PORT:-6280}"] 
