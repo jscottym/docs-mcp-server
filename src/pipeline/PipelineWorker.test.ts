@@ -1,10 +1,10 @@
-import { type Mock, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ScraperService } from "../scraper";
 import type { ScraperProgress } from "../scraper/types";
 import type { DocumentManagementService } from "../store/DocumentManagementService";
 import type { Document } from "../types";
 import { PipelineWorker } from "./PipelineWorker";
-import type { PipelineJob, PipelineManagerCallbacks } from "./types";
+import type { InternalPipelineJob, PipelineManagerCallbacks } from "./types";
 import { PipelineJobStatus } from "./types";
 
 // Mock dependencies
@@ -17,7 +17,7 @@ describe("PipelineWorker", () => {
   let mockScraperService: Partial<ScraperService>;
   let mockCallbacks: PipelineManagerCallbacks;
   let worker: PipelineWorker;
-  let mockJob: PipelineJob;
+  let mockJob: InternalPipelineJob;
   let abortController: AbortController;
 
   beforeEach(() => {
@@ -25,11 +25,12 @@ describe("PipelineWorker", () => {
 
     mockStore = {
       addDocument: vi.fn().mockResolvedValue(undefined),
+      removeAllDocuments: vi.fn().mockResolvedValue(undefined),
     };
 
     mockScraperService = {
       // Mock scrape to allow simulation of progress callbacks
-      scrape: vi.fn().mockImplementation(async (options, progressCallback, signal) => {
+      scrape: vi.fn().mockImplementation(async (_options, _progressCallback, _signal) => {
         // Default: simulate immediate completion with no documents
         return Promise.resolve();
       }),
@@ -52,13 +53,6 @@ describe("PipelineWorker", () => {
       id: "test-job-id",
       library: "test-lib",
       version: "1.0.0",
-      options: {
-        url: "http://example.com",
-        library: "test-lib",
-        version: "1.0.0",
-        maxPages: 10,
-        maxDepth: 1,
-      },
       status: PipelineJobStatus.RUNNING, // Assume worker receives a running job
       progress: null,
       error: null,
@@ -69,6 +63,11 @@ describe("PipelineWorker", () => {
       completionPromise: Promise.resolve(), // Mock promise parts if needed, but worker doesn't use them directly
       resolveCompletion: vi.fn(),
       rejectCompletion: vi.fn(),
+      sourceUrl: "http://example.com",
+      scraperOptions: {
+        maxPages: 10,
+        maxDepth: 1,
+      },
     };
   });
 
@@ -94,24 +93,26 @@ describe("PipelineWorker", () => {
 
     // Configure mock scrape to yield progress
     (mockScraperService.scrape as Mock).mockImplementation(
-      async (options, progressCallback, signal) => {
+      async (_options, progressCallback, _signal) => {
         const progress1: ScraperProgress = {
           pagesScraped: 1,
-          maxPages: 2,
+          totalPages: 2,
           currentUrl: "url1",
           depth: 1,
           maxDepth: 1,
           document: mockDoc1,
+          totalDiscovered: 0,
         };
         await progressCallback(progress1);
 
         const progress2: ScraperProgress = {
           pagesScraped: 2,
-          maxPages: 2,
+          totalPages: 2,
           currentUrl: "url2",
           depth: 1,
           maxDepth: 1,
           document: mockDoc2,
+          totalDiscovered: 0,
         };
         await progressCallback(progress2);
       },
@@ -119,10 +120,22 @@ describe("PipelineWorker", () => {
 
     await worker.executeJob(mockJob, mockCallbacks);
 
+    // Verify documents were cleared before scraping started
+    expect(mockStore.removeAllDocuments).toHaveBeenCalledOnce();
+    expect(mockStore.removeAllDocuments).toHaveBeenCalledWith(
+      mockJob.library,
+      mockJob.version,
+    );
+
     // Verify scrape was called
     expect(mockScraperService.scrape).toHaveBeenCalledOnce();
     expect(mockScraperService.scrape).toHaveBeenCalledWith(
-      mockJob.options,
+      {
+        url: mockJob.sourceUrl,
+        library: mockJob.library,
+        version: mockJob.version,
+        ...mockJob.scraperOptions,
+      },
       expect.any(Function), // The progress callback
       abortController.signal,
     );
@@ -149,8 +162,9 @@ describe("PipelineWorker", () => {
       expect.objectContaining({ document: mockDoc2 }),
     );
 
-    // Verify job progress object was updated
-    expect(mockJob.progress).toEqual(expect.objectContaining({ document: mockDoc2 }));
+    // Verify job progress object was NOT updated directly by worker
+    // The worker should only call callbacks - the manager handles progress updates
+    expect(mockJob.progress).toBeNull(); // Should remain null since worker doesn't update it directly
 
     // Verify no errors were reported
     expect(mockCallbacks.onJobError).not.toHaveBeenCalled();
@@ -178,14 +192,15 @@ describe("PipelineWorker", () => {
 
     // Simulate scrape yielding one document
     (mockScraperService.scrape as Mock).mockImplementation(
-      async (options, progressCallback, signal) => {
+      async (_options, progressCallback, _signal) => {
         const progress: ScraperProgress = {
           pagesScraped: 1,
-          maxPages: 1,
+          totalPages: 1,
           currentUrl: "url1",
           depth: 1,
           maxDepth: 1,
           document: mockDoc,
+          totalDiscovered: 0,
         };
         await progressCallback(progress);
       },
@@ -216,14 +231,15 @@ describe("PipelineWorker", () => {
 
     // Simulate scrape checking signal and throwing
     (mockScraperService.scrape as Mock).mockImplementation(
-      async (options, progressCallback, signal) => {
+      async (_options, progressCallback, _signal) => {
         const progress: ScraperProgress = {
           pagesScraped: 1,
-          maxPages: 2,
+          totalPages: 2,
           currentUrl: "url1",
           depth: 1,
           maxDepth: 1,
           document: mockDoc,
+          totalDiscovered: 0,
         };
         // Simulate cancellation happening *before* progress is processed by worker
         abortController.abort();
@@ -254,7 +270,7 @@ describe("PipelineWorker", () => {
   it("should throw CancellationError if cancelled after scrape completes", async () => {
     // Simulate scrape completing successfully
     (mockScraperService.scrape as Mock).mockImplementation(
-      async (options, progressCallback, signal) => {
+      async (_options, _progressCallback, _signal) => {
         // No progress needed for this test
         return Promise.resolve();
       },

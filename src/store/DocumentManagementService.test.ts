@@ -4,7 +4,6 @@ import { createFsFromVolume, vol } from "memfs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryNotFoundError, VersionNotFoundError } from "../tools/errors";
 import { StoreError } from "./errors";
-import type { LibraryVersionDetails } from "./types";
 
 vi.mock("node:fs", () => ({
   default: createFsFromVolume(vol),
@@ -34,11 +33,18 @@ const mockStore = {
   shutdown: vi.fn(),
   queryUniqueVersions: vi.fn(),
   checkDocumentExists: vi.fn(),
-  queryLibraryVersions: vi
-    .fn()
-    .mockResolvedValue(new Map<string, LibraryVersionDetails[]>()), // Add mock implementation
+  queryLibraryVersions: vi.fn().mockResolvedValue(new Map<string, any[]>()),
   addDocuments: vi.fn(),
   deleteDocuments: vi.fn(),
+  // Status tracking methods
+  updateVersionStatus: vi.fn(),
+  updateVersionProgress: vi.fn(),
+  getVersionsByStatus: vi.fn(),
+  // Scraper options methods
+  storeScraperOptions: vi.fn(),
+  getScraperOptions: vi.fn(),
+  findVersionsBySourceUrl: vi.fn(),
+  resolveLibraryAndVersionIds: vi.fn(),
 };
 
 // Mock the DocumentStore module
@@ -48,7 +54,6 @@ vi.mock("./DocumentStore", () => {
   return { DocumentStore: MockDocumentStore };
 });
 
-import { existsSync } from "node:fs";
 import { getProjectRoot } from "../utils/paths";
 // Import the mocked constructor AFTER vi.mock
 import { DocumentManagementService } from "./DocumentManagementService";
@@ -61,6 +66,16 @@ const mockRetriever = {
 
 vi.mock("./DocumentRetrieverService", () => ({
   DocumentRetrieverService: vi.fn().mockImplementation(() => mockRetriever),
+}));
+
+// Mock DocumentManagementClient for factory tests
+const mockClientInitialize = vi.fn().mockResolvedValue(undefined);
+const MockDocumentManagementClient = vi
+  .fn()
+  .mockImplementation((_url: string) => ({ initialize: mockClientInitialize }));
+
+vi.mock("./DocumentManagementClient", () => ({
+  DocumentManagementClient: MockDocumentManagementClient,
 }));
 
 // --- END MOCKS ---
@@ -130,7 +145,7 @@ describe("DocumentManagementService", () => {
       mockEnvPathsFn.mockReturnValue(mockEnvPaths);
 
       // Instantiate LOCALLY for this specific test
-      const localDocService = new DocumentManagementService();
+      const _localDocService = new DocumentManagementService();
 
       // Verify DocumentStore was called with the standard path
       expect(vi.mocked(DocumentStore)).toHaveBeenCalledWith(expectedStandardDbPath);
@@ -151,7 +166,7 @@ describe("DocumentManagementService", () => {
         // (vol.reset() in beforeEach should handle this)
 
         // Instantiate LOCALLY for this specific test
-        const localDocService = new DocumentManagementService();
+        const _localDocService = new DocumentManagementService();
 
         // Verify DocumentStore was called with the env var path
         expect(vi.mocked(DocumentStore)).toHaveBeenCalledWith(expectedEnvDbPath);
@@ -168,6 +183,104 @@ describe("DocumentManagementService", () => {
         // Restore original env var value
         process.env.DOCS_MCP_STORE_PATH = originalEnvValue;
       }
+    });
+  });
+
+  // --- ensureVersion tests ---
+  describe("ensureVersion", () => {
+    it("creates library and version when both absent", async () => {
+      mockStore.resolveLibraryAndVersionIds.mockResolvedValue({
+        libraryId: 1,
+        versionId: 10,
+      });
+      const id = await docService.ensureVersion({ library: "React", version: "18.2.0" });
+      expect(id).toBe(10);
+      // ensure normalize to lowercase
+      expect(mockStore.resolveLibraryAndVersionIds).toHaveBeenCalledWith(
+        "react",
+        "18.2.0",
+      );
+    });
+
+    it("handles unversioned refs (empty version string)", async () => {
+      mockStore.resolveLibraryAndVersionIds.mockResolvedValue({
+        libraryId: 2,
+        versionId: 20,
+      });
+      const id = await docService.ensureVersion({ library: "Lodash", version: "" });
+      expect(id).toBe(20);
+      expect(mockStore.resolveLibraryAndVersionIds).toHaveBeenCalledWith("lodash", "");
+    });
+
+    it("trims whitespace and normalizes version", async () => {
+      mockStore.resolveLibraryAndVersionIds.mockResolvedValue({
+        libraryId: 3,
+        versionId: 30,
+      });
+      const id = await docService.ensureVersion({
+        library: "  Express  ",
+        version: "  ",
+      });
+      expect(id).toBe(30);
+      expect(mockStore.resolveLibraryAndVersionIds).toHaveBeenCalledWith("express", "");
+    });
+
+    it("reuses single unversioned version across multiple ensureVersion calls (regression)", async () => {
+      // simulate same returned id each time
+      mockStore.resolveLibraryAndVersionIds
+        .mockResolvedValueOnce({ libraryId: 1, versionId: 10 })
+        .mockResolvedValueOnce({ libraryId: 1, versionId: 10 })
+        .mockResolvedValueOnce({ libraryId: 1, versionId: 10 });
+      const a = await docService.ensureVersion({ library: "TestLib", version: "" });
+      const b = await docService.ensureVersion({ library: "TestLib", version: "" });
+      const c = await docService.ensureVersion({ library: "TestLib", version: "" });
+      expect(a).toBe(10);
+      expect(b).toBe(10);
+      expect(c).toBe(10);
+      expect(mockStore.resolveLibraryAndVersionIds).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  // --- Factory function behavior tests ---
+  describe("DocumentManagement factory functions", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("createDocumentManagement() returns initialized local service by default", async () => {
+      const initSpy = vi.spyOn(DocumentManagementService.prototype, "initialize");
+      const { createDocumentManagement } = await import("./index");
+
+      const dm = await createDocumentManagement();
+
+      expect(initSpy).toHaveBeenCalledTimes(1);
+      expect(dm).toBeInstanceOf(DocumentManagementService);
+      // Should not construct remote client when no serverUrl is provided
+      expect(MockDocumentManagementClient).not.toHaveBeenCalled();
+    });
+
+    it("createDocumentManagement({serverUrl}) returns initialized remote client", async () => {
+      const { createDocumentManagement } = await import("./index");
+      const url = "http://localhost:8080";
+
+      const dm = await createDocumentManagement({ serverUrl: url });
+
+      expect(MockDocumentManagementClient).toHaveBeenCalledWith(url);
+      expect(mockClientInitialize).toHaveBeenCalledTimes(1);
+      // Not a local service instance
+      expect(dm).not.toBeInstanceOf(DocumentManagementService);
+    });
+
+    it("createLocalDocumentManagement() returns initialized local service", async () => {
+      const initSpy = vi.spyOn(DocumentManagementService.prototype, "initialize");
+      const { createLocalDocumentManagement } = await import("./index");
+
+      const dm = await createLocalDocumentManagement();
+
+      expect(initSpy).toHaveBeenCalledTimes(1);
+      expect(dm).toBeInstanceOf(DocumentManagementService);
+      // Should never touch remote client in local helper
+      expect(MockDocumentManagementClient).not.toHaveBeenCalled();
     });
   });
   // --- END: Constructor Path Logic Tests ---
@@ -310,11 +423,7 @@ describe("DocumentManagementService", () => {
         mockStore.queryUniqueVersions.mockResolvedValue(["1.0.0", "1.1.0", "1.2.0"]); // Fix: Use mockStoreInstance
 
         const versions = await docService.listVersions(library);
-        expect(versions).toEqual([
-          { version: "1.0.0" },
-          { version: "1.1.0" },
-          { version: "1.2.0" },
-        ]);
+        expect(versions).toEqual(["1.0.0", "1.1.0", "1.2.0"]);
         expect(mockStore.queryUniqueVersions).toHaveBeenCalledWith(library); // Fix: Use mockStoreInstance
       });
 
@@ -330,11 +439,7 @@ describe("DocumentManagementService", () => {
         ]);
 
         const versions = await docService.listVersions(library);
-        expect(versions).toEqual([
-          { version: "1.0.0" },
-          { version: "2.0.0-beta" },
-          { version: "2.0.0" },
-        ]);
+        expect(versions).toEqual(["1.0.0", "2.0.0-beta", "2.0.0"]);
         expect(mockStore.queryUniqueVersions).toHaveBeenCalledWith(library); // Fix: Use mockStoreInstance
       });
     });
@@ -455,20 +560,29 @@ describe("DocumentManagementService", () => {
     });
 
     describe("listLibraries", () => {
-      it("should list libraries and their detailed versions, including unversioned", async () => {
-        // Mock data now includes LibraryVersionDetails and unversioned cases
-        const mockLibraryMap = new Map<string, LibraryVersionDetails[]>([
+      it("should list libraries with enriched version metadata", async () => {
+        const mockLibraryMap = new Map([
           [
-            "lib1", // Standard case
+            "lib1",
             [
               {
                 version: "1.0.0",
+                versionId: 101,
+                status: "completed",
+                progressPages: 10,
+                progressMaxPages: 10,
+                sourceUrl: null,
                 documentCount: 10,
                 uniqueUrlCount: 5,
                 indexedAt: "2024-01-01T00:00:00.000Z",
               },
               {
                 version: "1.1.0",
+                versionId: 102,
+                status: "completed",
+                progressPages: 15,
+                progressMaxPages: 15,
+                sourceUrl: null,
                 documentCount: 15,
                 uniqueUrlCount: 7,
                 indexedAt: "2024-02-01T00:00:00.000Z",
@@ -476,10 +590,15 @@ describe("DocumentManagementService", () => {
             ],
           ],
           [
-            "lib2", // Standard case
+            "lib2",
             [
               {
                 version: "2.0.0",
+                versionId: 201,
+                status: "completed",
+                progressPages: 20,
+                progressMaxPages: 20,
+                sourceUrl: null,
                 documentCount: 20,
                 uniqueUrlCount: 10,
                 indexedAt: "2024-03-01T00:00:00.000Z",
@@ -487,10 +606,15 @@ describe("DocumentManagementService", () => {
             ],
           ],
           [
-            "unversioned-only", // Only unversioned
+            "unversioned-only",
             [
               {
                 version: "",
+                versionId: 300,
+                status: "completed",
+                progressPages: 1,
+                progressMaxPages: 1,
+                sourceUrl: null,
                 documentCount: 1,
                 uniqueUrlCount: 1,
                 indexedAt: "2024-04-01T00:00:00.000Z",
@@ -498,42 +622,60 @@ describe("DocumentManagementService", () => {
             ],
           ],
           [
-            "mixed-versions", // Semver and unversioned
+            "mixed-versions",
             [
               {
-                version: "", // Unversioned comes first from store sort
+                version: "",
+                versionId: 400,
+                status: "completed",
+                progressPages: 2,
+                progressMaxPages: 2,
+                sourceUrl: null,
                 documentCount: 2,
                 uniqueUrlCount: 1,
                 indexedAt: "2024-04-03T00:00:00.000Z",
               },
               {
                 version: "1.0.0",
+                versionId: 401,
+                status: "completed",
+                progressPages: 5,
+                progressMaxPages: 5,
+                sourceUrl: null,
                 documentCount: 5,
                 uniqueUrlCount: 2,
                 indexedAt: "2024-04-02T00:00:00.000Z",
               },
             ],
           ],
-        ]);
-        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap);
+        ] as any);
+        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap as any);
 
         const result = await docService.listLibraries();
-
-        // Assert the structure matches the new detailed format
-        expect(result).toEqual([
+        expect(
+          result.map((r) => ({
+            library: r.library,
+            versions: r.versions.map((v) => ({
+              ref: v.ref,
+              status: v.status,
+              counts: v.counts,
+              indexedAt: v.indexedAt,
+            })),
+          })),
+        ).toEqual([
           {
             library: "lib1",
             versions: [
               {
-                version: "1.0.0",
-                documentCount: 10,
-                uniqueUrlCount: 5,
+                ref: { library: "lib1", version: "1.0.0" },
+                status: "completed",
+                counts: { documents: 10, uniqueUrls: 5 },
                 indexedAt: "2024-01-01T00:00:00.000Z",
               },
               {
-                version: "1.1.0",
-                documentCount: 15,
-                uniqueUrlCount: 7,
+                ref: { library: "lib1", version: "1.1.0" },
+                status: "completed",
+                counts: { documents: 15, uniqueUrls: 7 },
                 indexedAt: "2024-02-01T00:00:00.000Z",
               },
             ],
@@ -542,9 +684,9 @@ describe("DocumentManagementService", () => {
             library: "lib2",
             versions: [
               {
-                version: "2.0.0",
-                documentCount: 20,
-                uniqueUrlCount: 10,
+                ref: { library: "lib2", version: "2.0.0" },
+                status: "completed",
+                counts: { documents: 20, uniqueUrls: 10 },
                 indexedAt: "2024-03-01T00:00:00.000Z",
               },
             ],
@@ -553,9 +695,9 @@ describe("DocumentManagementService", () => {
             library: "unversioned-only",
             versions: [
               {
-                version: "",
-                documentCount: 1,
-                uniqueUrlCount: 1,
+                ref: { library: "unversioned-only", version: "" },
+                status: "completed",
+                counts: { documents: 1, uniqueUrls: 1 },
                 indexedAt: "2024-04-01T00:00:00.000Z",
               },
             ],
@@ -564,15 +706,15 @@ describe("DocumentManagementService", () => {
             library: "mixed-versions",
             versions: [
               {
-                version: "",
-                documentCount: 2,
-                uniqueUrlCount: 1,
+                ref: { library: "mixed-versions", version: "" },
+                status: "completed",
+                counts: { documents: 2, uniqueUrls: 1 },
                 indexedAt: "2024-04-03T00:00:00.000Z",
               },
               {
-                version: "1.0.0",
-                documentCount: 5,
-                uniqueUrlCount: 2,
+                ref: { library: "mixed-versions", version: "1.0.0" },
+                status: "completed",
+                counts: { documents: 5, uniqueUrls: 2 },
                 indexedAt: "2024-04-02T00:00:00.000Z",
               },
             ],
@@ -584,7 +726,15 @@ describe("DocumentManagementService", () => {
       it("should return an empty array if there are no libraries", async () => {
         // Mock returns an empty map of the correct type
         mockStore.queryLibraryVersions.mockResolvedValue(
-          new Map<string, LibraryVersionDetails[]>(),
+          new Map<
+            string,
+            Array<{
+              version: string;
+              documentCount: number;
+              uniqueUrlCount: number;
+              indexedAt: string | null;
+            }>
+          >(),
         );
         const result = await docService.listLibraries();
         expect(result).toEqual([]);
@@ -594,20 +744,25 @@ describe("DocumentManagementService", () => {
       // Test case where store returns a library that only had an unversioned entry
       // (which is now included, not filtered by the store)
       it("should correctly handle libraries with only unversioned entries", async () => {
-        const mockLibraryMap = new Map<string, LibraryVersionDetails[]>([
+        const mockLibraryMap = new Map([
           [
             "lib-unversioned",
             [
               {
-                version: "", // The unversioned entry
+                version: "",
+                versionId: 999,
+                status: "completed",
+                progressPages: 0,
+                progressMaxPages: 0,
+                sourceUrl: null,
                 documentCount: 3,
                 uniqueUrlCount: 2,
                 indexedAt: "2024-04-04T00:00:00.000Z",
               },
             ],
           ],
-        ]);
-        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap);
+        ] as any);
+        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap as any);
 
         const result = await docService.listLibraries();
         expect(result).toEqual([
@@ -615,14 +770,17 @@ describe("DocumentManagementService", () => {
             library: "lib-unversioned",
             versions: [
               {
-                version: "",
-                documentCount: 3,
-                uniqueUrlCount: 2,
+                id: 999,
+                ref: { library: "lib-unversioned", version: "" },
+                status: "completed",
+                counts: { documents: 3, uniqueUrls: 2 },
                 indexedAt: "2024-04-04T00:00:00.000Z",
+                sourceUrl: undefined,
               },
             ],
           },
         ]);
+        expect(result[0].versions[0].progress).toBeUndefined();
         expect(mockStore.queryLibraryVersions).toHaveBeenCalledTimes(1);
       });
     });
@@ -739,13 +897,26 @@ describe("DocumentManagementService", () => {
         mockStore.queryUniqueVersions.mockResolvedValue([]); // Fix: Use mockStoreInstance
         mockStore.checkDocumentExists.mockResolvedValue(false); // Fix: Use mockStoreInstance
         // Mock listLibraries to return existing libraries
-        const mockLibraryMap = new Map(
+        const mockLibraryMap = new Map<
+          string,
+          Array<{
+            version: string;
+            documentCount: number;
+            uniqueUrlCount: number;
+            indexedAt: string | null;
+          }>
+        >(
           existingLibraries.map((l) => [
             l.library,
-            new Set(l.versions.map((v) => v.version)),
+            l.versions.map((v) => ({
+              version: v.version,
+              documentCount: 0,
+              uniqueUrlCount: 0,
+              indexedAt: null,
+            })),
           ]),
         );
-        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap); // Fix: Use mockStoreInstance
+        mockStore.queryLibraryVersions.mockResolvedValue(mockLibraryMap);
 
         await expect(docService.validateLibraryExists(misspelledLibrary)).rejects.toThrow(
           LibraryNotFoundError,
@@ -781,6 +952,269 @@ describe("DocumentManagementService", () => {
         // Verify the mocks were called with the LOWERCASE name
         expect(mockStore.queryUniqueVersions).toHaveBeenCalledWith(libraryLower);
         expect(mockStore.checkDocumentExists).toHaveBeenCalledWith(libraryLower, "");
+      });
+    });
+
+    describe("Pipeline Integration Methods", () => {
+      it("should delegate status tracking to store", async () => {
+        const versionId = 123;
+        const status = "queued";
+        const errorMessage = "Test error";
+
+        // Test updateVersionStatus
+        await docService.updateVersionStatus(versionId, status as any, errorMessage);
+        expect(mockStore.updateVersionStatus).toHaveBeenCalledWith(
+          versionId,
+          status,
+          errorMessage,
+        );
+
+        // Test updateVersionProgress
+        await docService.updateVersionProgress(versionId, 5, 10);
+        expect(mockStore.updateVersionProgress).toHaveBeenCalledWith(versionId, 5, 10);
+
+        // Test getVersionsByStatus
+        mockStore.getVersionsByStatus.mockResolvedValue([]);
+        await docService.getVersionsByStatus(["queued"] as any);
+        expect(mockStore.getVersionsByStatus).toHaveBeenCalledWith(["queued"]);
+
+        // Test getVersionsByStatus (legacy running replacement)
+        mockStore.getVersionsByStatus.mockResolvedValue([]);
+        await docService.getVersionsByStatus(["running"] as any);
+        expect(mockStore.getVersionsByStatus).toHaveBeenCalledWith(["running"]);
+
+        // Test getVersionsByStatus (legacy active replacement)
+        mockStore.getVersionsByStatus.mockResolvedValue([]);
+        await docService.getVersionsByStatus(["queued", "running", "updating"] as any);
+        expect(mockStore.getVersionsByStatus).toHaveBeenCalledWith([
+          "queued",
+          "running",
+          "updating",
+        ]);
+      });
+
+      it("should delegate scraper options storage to store", async () => {
+        const versionId = 456;
+        const scraperOptions = {
+          url: "https://example.com",
+          library: "testlib",
+          version: "1.0.0",
+          maxDepth: 3,
+          maxPages: 100,
+        };
+
+        // Test storeScraperOptions
+        await docService.storeScraperOptions(versionId, scraperOptions);
+        expect(mockStore.storeScraperOptions).toHaveBeenCalledWith(
+          versionId,
+          scraperOptions,
+        );
+
+        // Test getScraperOptions
+        mockStore.getScraperOptions.mockResolvedValue(null);
+        await docService.getScraperOptions(versionId);
+        expect(mockStore.getScraperOptions).toHaveBeenCalledWith(versionId);
+
+        // Test findVersionsBySourceUrl
+        const sourceUrl = "https://docs.example.com";
+        mockStore.findVersionsBySourceUrl.mockResolvedValue([]);
+        await docService.findVersionsBySourceUrl(sourceUrl);
+        expect(mockStore.findVersionsBySourceUrl).toHaveBeenCalledWith(sourceUrl);
+      });
+
+      it("should ensure library and version creation", async () => {
+        const library = "NewLib";
+        const version = "2.0.0";
+        const expectedVersionId = 789;
+
+        // Mock the store method
+        mockStore.resolveLibraryAndVersionIds.mockResolvedValue({
+          libraryId: 123,
+          versionId: expectedVersionId,
+        });
+
+        const result = await docService.ensureLibraryAndVersion(library, version);
+
+        // Should normalize library name to lowercase and version
+        expect(mockStore.resolveLibraryAndVersionIds).toHaveBeenCalledWith(
+          "newlib",
+          "2.0.0",
+        );
+        expect(result).toBe(expectedVersionId);
+      });
+
+      it("should handle version normalization in scraper methods", async () => {
+        const versionId = 999;
+        mockStore.getScraperOptions
+          .mockResolvedValueOnce({ sourceUrl: "https://a", options: {} as any })
+          .mockResolvedValueOnce({ sourceUrl: "https://b", options: {} as any });
+
+        const result1 = await docService.getScraperOptions(versionId);
+        const result2 = await docService.getScraperOptions(versionId);
+
+        expect(result1?.sourceUrl).toEqual("https://a");
+        expect(result2?.sourceUrl).toEqual("https://b");
+        expect(mockStore.getScraperOptions).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    describe("getScraperOptions (service wrapper)", () => {
+      it("should return stored object then null on subsequent call (combined happy/null path)", async () => {
+        const versionId = 42;
+        const stored = {
+          sourceUrl: "https://docs.example.com",
+          options: { maxDepth: 5 },
+        };
+        mockStore.getScraperOptions
+          .mockResolvedValueOnce(stored)
+          .mockResolvedValueOnce(null);
+
+        const first = await docService.getScraperOptions(versionId);
+        const second = await docService.getScraperOptions(versionId);
+        expect(first).toEqual(stored);
+        expect(second).toBeNull();
+        expect(mockStore.getScraperOptions).toHaveBeenNthCalledWith(1, versionId);
+        expect(mockStore.getScraperOptions).toHaveBeenNthCalledWith(2, versionId);
+      });
+    });
+
+    describe("listLibraries (enriched summaries)", () => {
+      it("returns empty array when no libraries", async () => {
+        mockStore.queryLibraryVersions.mockResolvedValue(new Map());
+        mockStore.getVersionsByStatus.mockResolvedValue([]);
+        const result = await docService.listLibraries();
+        expect(result).toEqual([]);
+      });
+
+      it("passes through multiple statuses and progress fields for enriched rows", async () => {
+        const enrichedMap = new Map<string, any[]>([
+          [
+            "libStatus",
+            [
+              {
+                version: "1.0.0",
+                versionId: 11,
+                status: "completed",
+                progressPages: 10,
+                progressMaxPages: 10,
+                sourceUrl: "https://ex/libStatus/1.0.0",
+                documentCount: 50,
+                uniqueUrlCount: 45,
+                indexedAt: "2024-02-01T00:00:00.000Z",
+              },
+              {
+                version: "1.1.0",
+                versionId: 12,
+                status: "failed",
+                progressPages: 3,
+                progressMaxPages: 8,
+                sourceUrl: "https://ex/libStatus/1.1.0",
+                documentCount: 12,
+                uniqueUrlCount: 10,
+                indexedAt: null,
+              },
+              {
+                version: "2.0.0",
+                versionId: 13,
+                status: "cancelled",
+                progressPages: 5,
+                progressMaxPages: 20,
+                sourceUrl: null,
+                documentCount: 0,
+                uniqueUrlCount: 0,
+                indexedAt: null,
+              },
+              {
+                version: "",
+                versionId: 14,
+                status: "not_indexed",
+                progressPages: 0,
+                progressMaxPages: 0,
+                sourceUrl: null,
+                documentCount: 0,
+                uniqueUrlCount: 0,
+                indexedAt: null,
+              },
+            ],
+          ],
+        ]);
+        mockStore.queryLibraryVersions.mockResolvedValue(enrichedMap);
+
+        const result = await docService.listLibraries();
+        const lib = result.find((r) => r.library === "libStatus");
+        expect(lib).toBeTruthy();
+        const byVer = Object.fromEntries(
+          lib!.versions.map((v) => [v.ref.version || "__unver__", v]),
+        );
+        expect(byVer["1.0.0"]).toMatchObject({
+          status: "completed",
+          // progress omitted for completed
+        });
+        expect(byVer["1.1.0"]).toMatchObject({
+          status: "failed",
+          progress: { pages: 3, maxPages: 8 },
+        });
+        expect(byVer["2.0.0"]).toMatchObject({
+          status: "cancelled",
+          progress: { pages: 5, maxPages: 20 },
+        });
+        expect(byVer.__unver__).toMatchObject({
+          status: "not_indexed",
+          progress: { pages: 0, maxPages: 0 },
+        });
+        // Explicitly ensure progress is undefined for completed version
+        expect(byVer["1.0.0"].progress).toBeUndefined();
+      });
+
+      it("omits progress for completed versions but includes for active ones", async () => {
+        const enrichedMap = new Map<string, any[]>([
+          [
+            "libActive",
+            [
+              {
+                version: "1.0.0",
+                versionId: 21,
+                status: "completed",
+                progressPages: 5,
+                progressMaxPages: 5,
+                sourceUrl: null,
+                documentCount: 10,
+                uniqueUrlCount: 9,
+                indexedAt: "2024-05-01T00:00:00.000Z",
+              },
+              {
+                version: "1.1.0",
+                versionId: 22,
+                status: "running",
+                progressPages: 2,
+                progressMaxPages: 10,
+                sourceUrl: null,
+                documentCount: 4,
+                uniqueUrlCount: 4,
+                indexedAt: null,
+              },
+              {
+                version: "1.2.0",
+                versionId: 23,
+                status: "queued",
+                progressPages: 0,
+                progressMaxPages: 10,
+                sourceUrl: null,
+                documentCount: 0,
+                uniqueUrlCount: 0,
+                indexedAt: null,
+              },
+            ],
+          ],
+        ]);
+        mockStore.queryLibraryVersions.mockResolvedValue(enrichedMap);
+        const result = await docService.listLibraries();
+        const lib = result.find((r) => r.library === "libActive");
+        expect(lib).toBeTruthy();
+        const byVer = Object.fromEntries(lib!.versions.map((v) => [v.ref.version, v]));
+        expect(byVer["1.0.0"].progress).toBeUndefined();
+        expect(byVer["1.1.0"].progress).toEqual({ pages: 2, maxPages: 10 });
+        expect(byVer["1.2.0"].progress).toEqual({ pages: 0, maxPages: 10 });
       });
     });
   }); // Closing brace for describe("Core Functionality", ...)

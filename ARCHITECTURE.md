@@ -1,178 +1,289 @@
 # Documentation MCP Server Architecture
 
-## Overview
+## System Overview
 
-The Documentation MCP Server provides a unified system for scraping, storing, and searching documentation. It offers two main interfaces: a Command Line Interface (CLI) and a Model Context Protocol (MCP) Server.
+The Documentation MCP Server indexes documentation from web sources, local files, and package registries, making it searchable via the Model Context Protocol (MCP). The system processes content into vector embeddings and provides search capabilities to AI coding assistants.
 
-### Key Technologies
+### Core Functions
 
-The project uses:
+- Documentation scraping from web, local files, npm/PyPI registries
+- Semantic search using vector embeddings (OpenAI, Google, Azure, AWS providers)
+- Version-specific documentation queries
+- Asynchronous job processing with recovery
+- Multiple access interfaces: CLI, MCP protocol, web UI
 
-- **Build Tool:** Vite
-- **Testing:** Vitest
-- **Web Interface:** HTMX, AlpineJS
-- **Core Logic:** LangChain.js for embedding generation
+### Deployment Modes
 
-### Code Conventions
+The system runs in two modes:
 
-- Class files use `PascalCase` (e.g., `PipelineManager.ts`).
-- Other files use `kebab-case` or `camelCase` (e.g., `index.ts`, `scraper-service.ts`).
-- Avoid `any` types; prefer `unknown` or specific types.
+**Unified Server**: Single process containing MCP server, web interface, and embedded worker. Default mode for development and simple deployments.
+
+**Distributed Mode**: Separate coordinator and worker processes. Used for scaling processing workload across multiple containers.
+
+Protocol selection is automatic - stdio transport for AI tools (no TTY), HTTP transport for interactive terminals (has TTY).
+
+### Technology Stack
+
+- Node.js 22.x, TypeScript, Vite build system
+- Vitest for testing
+- HTMX, AlpineJS, TailwindCSS for web interface
+- LangChain.js for embeddings, Playwright for scraping
+- SQLite with schema migrations
 
 ### Directory Structure
 
 ```
 src/
-├── index.ts                         # Unified CLI, MCP Server, and Web entry point
-├── mcp/                             # MCP server implementation details
-├── pipeline/                        # Asynchronous job processing pipeline
-│   ├── PipelineManager.ts           # Manages job queue, concurrency, state
-│   └── PipelineWorker.ts            # Executes a single pipeline job
-├── scraper/                         # Web scraping implementation
-│   ├── strategies/                  # Scraping strategies for different sources
-│   ├── fetcher/                     # Content fetching abstractions
-│   ├── middleware/                  # Individual middleware implementations
-│   ├── pipelines/                   # HTML and markdown pipelines
-│   └── ...
-├── splitter/                        # Document splitting and chunking
-├── store/                           # Document storage and retrieval
-│   ├── DocumentManagementService.ts # Manages document storage and updates
-│   ├── DocumentRetrieverService.ts  # Handles document retrieval and context
-│   ├── DocumentStore.ts             # Low-level database interactions
-│   └── ...
-├── tools/                           # Core functionality tools
-├── types/                           # Shared type definitions
-└── utils/                           # Common utilities and helpers
-    ├── config.ts                    # Centralized configuration constants
-    ├── logger.ts                    # Centralized logging system
-    └── ...
+├── index.ts                         # Main entry point with CLI, protocol detection
+├── app/                             # Unified server implementation
+│   ├── AppServer.ts                 # Modular service composition
+│   └── AppServerConfig.ts           # Service configuration interface
+├── mcp/                             # MCP server implementation
+│   ├── mcpServer.ts                 # MCP protocol server
+│   ├── tools.ts                     # MCP tool definitions
+│   └── startStdioServer.ts          # Stdio transport setup
+├── pipeline/                        # Asynchronous job processing
+│   ├── PipelineFactory.ts           # Smart pipeline selection
+│   ├── PipelineManager.ts           # Job queue and worker coordination
+│   ├── PipelineClient.ts            # External worker RPC client (tRPC)
+│   ├── PipelineWorker.ts            # Individual job execution
+│   └── trpc/                        # tRPC router for pipeline procedures
+├── scraper/                         # Content acquisition and processing
+│   ├── fetcher/                     # HTTP and file content fetching
+│   ├── middleware/                  # Content transformation pipeline
+│   ├── pipelines/                   # HTML and Markdown processing
+│   ├── strategies/                  # Source-specific scraping strategies
+│   └── utils/                       # Scraping utilities
+├── services/                        # Service registration functions
+│   ├── mcpService.ts                # MCP service registration
+│   ├── webService.ts                # Web interface service
+│   ├── workerService.ts             # Worker service registration
+│   └── trpcService.ts               # tRPC service registration
+├── splitter/                        # Document chunking and segmentation
+│   ├── GreedySplitter.ts            # Size-based splitting
+│   ├── SemanticMarkdownSplitter.ts  # Structure-aware splitting
+│   └── splitters/                   # Additional splitting strategies
+├── store/                           # Data storage and retrieval
+│   ├── DocumentManagementService.ts # Document CRUD operations
+│   ├── DocumentRetrieverService.ts  # Search and context retrieval
+│   ├── DocumentStore.ts             # Low-level database operations
+│   └── embeddings/                  # Embedding generation and management
+├── tools/                           # Business logic implementations
+│   ├── ScrapeTool.ts                # Documentation scraping
+│   ├── SearchTool.ts                # Document search
+│   ├── ListLibrariesTool.ts         # Library management
+│   └── ...                          # Job and document management tools
+├── types/                           # Shared TypeScript interfaces
+├── utils/                           # Common utilities
+│   ├── config.ts                    # Configuration constants
+│   ├── logger.ts                    # Centralized logging
+│   └── paths.ts                     # Path resolution utilities
+└── web/                             # Web interface implementation
+    ├── routes/                      # HTTP route handlers
+    ├── components/                  # JSX UI components
+    └── assets/                      # Static web assets
 ```
 
-## Configuration Management
+## System Architecture
 
-Default configuration values for the server and its components are defined as constants within `src/utils/config.ts`. This centralizes configuration and simplifies adjustments.
-
-## Core Components Interaction
-
-The system's core functionality revolves around how `scraper`, `fetcher`, `middleware`, `pipeline`, and `splitter` work together to process documentation.
-
-### Scraper, Fetcher, Middleware, and Pipeline
-
-The scraping process is modular and handles various content sources:
-
-- **Content Sources**: Web (HTTP/HTTPS), local filesystem (file://), and package registries (npm, PyPI).
-
-The content processing flow is as follows:
-
-1.  **Fetcher**: Retrieves `RawContent` (raw content, MIME type, charset, URL) from a source.
-2.  **Middleware**: `RawContent` is transformed into `MiddlewareContext` and passes through a series of `ContentProcessorMiddleware` components. Each middleware performs a specific task (e.g., parsing HTML, extracting metadata, converting to Markdown).
-3.  **Pipeline**: `ContentProcessorMiddleware` components are organized into `ContentPipeline` implementations (e.g., `HtmlPipeline`, `MarkdownPipeline`) based on content type. A `scraper` strategy selects the appropriate pipeline.
-4.  **Splitter**: After processing by the pipeline, the content is sent to a `splitter` which breaks it into smaller, manageable chunks for indexing.
+The system uses a layered architecture where interfaces delegate to shared tools, which coordinate pipeline operations for content processing and storage.
 
 ```mermaid
 graph TD
-    F[Fetcher: Gets Raw Content] --> P_Start(Start Pipeline)
-    subgraph P[Pipeline: Processes Content]
-        P_Start --> M1[Middleware: Parse HTML/Markdown]
-        M1 --> M2[Middleware: Extract Metadata/Links]
-        M2 --> M3[...]
-        M3 --> P_End(End Pipeline)
+    subgraph "Access Layer"
+        CLI[CLI Commands]
+        WEB[Web Interface]
+        MCP[MCP Server]
     end
-    P_End --> S[Splitter: Chunks Content]
-    S --> I[Indexer: Stores Chunks]
+
+    subgraph "Business Logic"
+        TOOLS[Tools Layer]
+    end
+
+    subgraph "Pipeline Management"
+        FACTORY[PipelineFactory]
+        MANAGER[PipelineManager]
+        CLIENT[PipelineClient]
+        WORKER[PipelineWorker]
+    end
+
+    subgraph "Content Processing"
+        SCRAPER[Scraper]
+        SPLITTER[Splitter]
+        EMBEDDER[Embeddings]
+    end
+
+    subgraph "Data Layer"
+        DOCMGMT[DocumentManagement]
+        STORE[DocumentStore]
+        DB[(SQLite)]
+    end
+
+    CLI --> TOOLS
+    WEB --> TOOLS
+    MCP --> TOOLS
+    TOOLS --> FACTORY
+    FACTORY --> MANAGER
+    FACTORY --> CLIENT
+    MANAGER --> WORKER
+    WORKER --> SCRAPER
+    SCRAPER --> SPLITTER
+    SPLITTER --> EMBEDDER
+    EMBEDDER --> DOCMGMT
+    DOCMGMT --> STORE
+    STORE --> DB
 ```
 
-## Tools Layer
+### Protocol Auto-Detection
 
-The `tools/` directory contains modular implementations of core functionality, ensuring features are shared and reused across interfaces (CLI, MCP, Web). Business logic is implemented once, simplifying testing and maintenance.
+The entry point resolves protocol based on TTY status:
 
-Common tools include:
+- No TTY (stdin/stdout redirected): stdio transport for direct MCP communication
+- Has TTY (interactive terminal): HTTP transport with Server-Sent Events
+- Manual override: `--protocol stdio|http` bypasses detection
 
-- Documentation scraping
-- Search capabilities
-- Library version management
-- Job management (listing, status, cancellation)
-- Document management operations
-- URL fetching and conversion to Markdown
+### Pipeline Selection
 
-Both the CLI and MCP server directly use these tools. The Web interface also interacts with these tools to provide its functionality.
+The PipelineFactory chooses implementation based on configuration:
 
-## Pipeline Architecture
+Naming clarifies the mode: PipelineManager runs an in-process worker; PipelineClient connects to an out-of-process worker via tRPC.
 
-The document processing is managed by an asynchronous, queue-based system:
+- `serverUrl` specified: PipelineClient for external worker communication
+- `recoverJobs: true`: PipelineManager with job recovery from database
+- `recoverJobs: false`: PipelineManager without recovery (CLI commands)
 
-- **`PipelineManager`**: Manages a queue of jobs (e.g., scraping tasks), controls concurrency, and tracks job status.
-- **`PipelineWorker`**: Executes individual jobs from the queue, orchestrating the scraping and storage of documents.
+## Core Components
 
-This separation ensures efficient, scalable processing of documentation.
+### Tools Layer
 
-## Document Storage
+Business logic resides in the tools layer to enable code reuse across interfaces. Tools operate on shared pipeline and storage services, eliminating interface-specific implementations. CLI commands, MCP endpoints, and web routes all delegate to the same tool implementations.
 
-The project uses SQLite for document storage. Database schema changes are managed through sequential SQL migrations located in the `db/migrations/` directory.
+The tools layer includes:
 
-The database file (`documents.db`) location is determined dynamically: it first checks for a `.store` directory in the current project, then defaults to an OS-specific application data directory for persistence.
+- Document scraping with configuration persistence
+- Semantic search across indexed content
+- Library and version management
+- Job lifecycle management (status, progress, cancellation)
+- URL fetching and markdown conversion
 
-Documents are stored with URLs and sequential ordering to maintain source context for search results. Document embeddings are generated by the `EmbeddingFactory` (`src/store/embeddings/EmbeddingFactory.ts`) using LangChain.js, supporting various providers and ensuring consistent 1536-dimensional vectors for database compatibility.
+### Pipeline Management
 
-### Document Management and Retrieval
+The pipeline system manages asynchronous job processing with persistent state:
 
-The document storage and retrieval system is divided into two main services:
+**PipelineManager**: Coordinates job queue, concurrency limits, and state synchronization. Maintains write-through architecture where job state updates immediately persist to database.
 
-- **`DocumentManagementService`**: Manages documents within the store, handling additions, deletions, updates, and finding best matching library versions.
-- **`DocumentRetrieverService`**: Focuses on retrieving documents and providing contextual information, including searching and fetching related content (e.g., parent, child, sibling chunks).
+**PipelineWorker**: Executes individual jobs, orchestrating content fetching, processing, and storage. Reports progress through callbacks to the manager.
 
-## Web Interface
+**PipelineClient**: tRPC client that provides identical interface to PipelineManager for external worker communication.
 
-The web interface provides a GUI for interacting with the server, built with a server-side rendered architecture using Fastify, `@kitajs/html` for JSX rendering, HTMX for dynamic updates, Tailwind/Flowbite for styling, and AlpineJS for client-side interactivity.
+Job states progress through: QUEUED → RUNNING → COMPLETED/FAILED/CANCELLED. All state transitions persist to database, enabling recovery after restart.
 
-### Component Structure
+### Content Processing
 
-The web interface is organized into:
+Content processing follows a middleware pipeline pattern:
 
-- **Routes (`src/web/routes/`)**: Handle data fetching using core Tools and compose the UI.
-- **Components (`src/web/components/`)**: Reusable JSX components for rendering specific UI parts.
+1. **Fetcher**: Retrieves raw content from HTTP, file://, or package registry URLs
+2. **Middleware Chain**: Transforms content through parsing, metadata extraction, link processing
+3. **Pipeline Selection**: Routes to HtmlPipeline or MarkdownPipeline based on content type
+4. **Splitter**: Segments processed content into semantic chunks preserving structure
+5. **Embedder**: Generates vector embeddings using configured provider
 
-### AlpineJS and HTMX Interaction Pattern
+The scraper system supports multiple content sources and maintains URL context for search result attribution.
 
-When using AlpineJS with HTMX, avoid calling the global `htmx` object directly from Alpine event handlers (`x-on:`). Instead, dispatch a standard browser `CustomEvent` from the Alpine component, and configure `hx-trigger` on the same element to listen for this event. This decouples Alpine's scope from HTMX.
+### Storage Architecture
 
-## Interface-Specific Adapters
+SQLite database with normalized schema:
 
-- **Unified Entry Point (`src/index.ts`)**: This is the primary entry point for the application, responsible for initializing shared services and routing execution to either CLI commands, the MCP server, or the web interface based on the provided arguments.
-- **MCP Server Logic (`src/mcp/index.ts` and `src/mcp/tools.ts`)**: Implements the MCP protocol, exposing core functionalities from the `tools/` directory as MCP tools.
+- `libraries`: Library metadata and organization
+- `versions`: Version tracking with indexing status and configuration
+- `documents`: Content chunks with embeddings and metadata
 
-Common MCP tools include:
+The `versions` table serves as the job state hub, storing progress, errors, and scraper configuration for reproducible re-indexing.
 
-- `scrape_docs`: Starts a scraping job.
-- `search_docs`: Searches indexed documentation.
-- `list_libraries`: Lists indexed libraries.
-- `get_job_info`: Retrieves job status.
-- `cancel_job`: Cancels a job.
+DocumentManagementService handles CRUD operations and version resolution. DocumentRetrieverService provides search with vector similarity and full-text search combination.
 
-## Progress Reporting
+## Interface Implementations
 
-A unified progress reporting system, managed by the `PipelineManager`, provides:
+### Web Interface
 
-- Job-level status updates (`onJobStatusChange`).
-- Detailed progress updates during job execution (`onJobProgress`).
-- Error reporting within a job (`onJobError`).
+Server-side rendered application using Fastify with JSX components. HTMX provides dynamic updates without client-side JavaScript frameworks. AlpineJS handles client-side interactivity within components.
 
-## Logging Strategy
+Routes delegate to tools layer for data operations. Components poll for job status updates every 3 seconds, displaying progress bars and status changes in real-time.
 
-A centralized logging system (`utils/logger.ts`) provides hierarchical logging for clear visibility and consistent error reporting across layers:
+HTMX and AlpineJS integration uses custom events to decouple component interactions from global HTMX state.
 
-1.  **Tools Layer**: User-facing operations, final results.
-2.  **Core Components**: Operational logs, store management.
-3.  **Strategy Layer**: Detailed progress (e.g., page crawling), error conditions.
+### MCP Protocol Integration
 
-## Testing Conventions
+The MCP server exposes tools as protocol-compliant endpoints. Multiple transports are supported:
 
-Tests use `Vitest` for mocking. `vi.mock` calls are hoisted, so mock implementations must be defined after the `vi.mock` call but before importing the actual module to be mocked. This ensures mocks are set up correctly before dependent modules are imported. For examples, refer to `src/pipeline/PipelineManager.test.ts`.
+- **stdio transport**: For command-line integration and AI tools
+- **HTTP transport**: Provides `/mcp` (Streamable HTTP) and `/sse` (Server-Sent Events) endpoints
 
-## Releasing
+Protocol selection is automatic - stdio transport for AI tools (no TTY), HTTP transport for interactive terminals (has TTY).
 
-The project uses `semantic-release` and `Conventional Commits` for automated releases. Releases are triggered manually via GitHub Actions.
+Available MCP tools mirror CLI functionality: document scraping, search, library management, and job control. Tools maintain identical interfaces across CLI and MCP access methods.
 
-## Future Considerations
+### Configuration and Deployment
 
-When adding new functionality or scraping capabilities, implement core logic as new tools, design for efficient data handling, and integrate with existing pipelines and strategies.
+Configuration uses environment variables with sensible defaults. Database location auto-detects project-local storage or system application directory.
+
+The AppServer provides modular service composition, enabling selective feature activation based on deployment requirements.
+
+## Development Guidelines
+
+### Code Organization
+
+- Tools implement business logic with interface-agnostic design
+- Pipeline components handle asynchronous processing concerns
+- Storage layer abstracts database operations with migration support
+- Interfaces delegate to tools rather than implementing logic directly
+
+### Testing Strategy
+
+Tests focus on public API behavior and observable side effects. Mock only external dependencies (databases, APIs, filesystem). Tests should remain stable across refactoring by avoiding implementation detail assertions.
+
+### Logging
+
+Hierarchical logging strategy:
+
+- Tools layer: User-facing operations and results
+- Core components: Operational status and state changes
+- Processing layer: Detailed progress and error conditions
+
+Use `console.*` for direct user output, `logger.*` for application events.
+
+### Error Handling
+
+Errors propagate through the tools layer with context preservation. Job failures store detailed error information for debugging and user feedback.
+
+## Architectural Patterns
+
+### Write-Through Architecture
+
+Pipeline jobs serve as single source of truth, containing both runtime state and database fields. All updates immediately synchronize to database, ensuring consistency and recovery capability.
+
+### Functionality-Based Design
+
+Components are selected based on capability requirements rather than deployment context. PipelineFactory chooses implementations based on desired functionality (embedded vs external, recovery vs immediate).
+
+### Protocol Abstraction
+
+Transport layer abstracts stdio vs HTTP differences, enabling identical tool functionality across access methods.
+
+## Extension Points
+
+New functionality should follow established patterns:
+
+- Implement core logic in tools layer for interface reuse
+- Add pipeline workers for new content processing types
+- Extend scraper middleware for additional content sources
+- Use migration system for schema changes
+
+## References
+
+Detailed documentation for specific architectural areas:
+
+- `docs/deployment-modes.md` - Protocol detection and server modes
+- `docs/pipeline-architecture.md` - Job processing and worker coordination
+- `docs/content-processing.md` - Scraping and document processing
+- `docs/data-storage.md` - Database design and embedding management

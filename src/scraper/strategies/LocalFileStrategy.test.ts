@@ -2,6 +2,7 @@ import { vol } from "memfs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ScraperOptions } from "../types";
 import { LocalFileStrategy } from "./LocalFileStrategy";
+
 vi.mock("node:fs/promises", () => ({ default: vol.promises }));
 vi.mock("../../utils/logger");
 vi.mock("node:fs");
@@ -44,7 +45,7 @@ describe("LocalFileStrategy", () => {
         currentUrl: "file:///test.md",
         depth: 0,
         maxDepth: 0,
-        maxPages: 1,
+        totalPages: 1,
         document: {
           content: "# Test\n\nThis is a test file.",
           metadata: {
@@ -117,7 +118,7 @@ describe("LocalFileStrategy", () => {
         currentUrl: "file:///testdir/file1.md",
         depth: 1,
         maxDepth: 1,
-        maxPages: 10,
+        totalPages: 4,
         document: expect.objectContaining({
           content: "# File 1",
           metadata: expect.objectContaining({
@@ -137,7 +138,7 @@ describe("LocalFileStrategy", () => {
         currentUrl: "file:///testdir/file2.html",
         depth: 1,
         maxDepth: 1,
-        maxPages: 10,
+        totalPages: 4,
         document: expect.objectContaining({
           content: expect.stringContaining("# File 2"),
           metadata: expect.objectContaining({
@@ -157,7 +158,7 @@ describe("LocalFileStrategy", () => {
         currentUrl: "file:///testdir/file3.txt",
         depth: 1,
         maxDepth: 1,
-        maxPages: 10,
+        totalPages: 4,
         document: expect.objectContaining({
           content: "File 3",
           metadata: expect.objectContaining({

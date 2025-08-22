@@ -1,9 +1,9 @@
 import * as cheerio from "cheerio";
-import { type MockedObject, afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, type MockedObject, vi } from "vitest";
 import type { ScraperOptions } from "../types";
 import {
-  HtmlPlaywrightMiddleware,
   extractCredentialsAndOrigin,
+  HtmlPlaywrightMiddleware,
   mergePlaywrightHeaders,
 } from "./HtmlPlaywrightMiddleware";
 import type { MiddlewareContext } from "./types"; // Adjusted path
@@ -22,7 +22,7 @@ vi.mock("jsdom", async (importOriginal) => {
   return { ...actual };
 });
 
-import { type Browser, type Page, chromium } from "playwright";
+import { type Browser, chromium, type Page } from "playwright";
 
 // Helper to create a minimal valid ScraperOptions object
 const createMockScraperOptions = (
@@ -68,9 +68,9 @@ describe("HtmlPlaywrightMiddleware", () => {
   afterEach(() => {
     // Reset the browser instance after each test
     // This ensures a clean state for each test
-    // @ts-ignore
+    // @ts-expect-error
     playwrightMiddleware.browser?.close();
-    // @ts-ignore
+    // @ts-expect-error
     playwrightMiddleware.browser = null;
   });
 
@@ -82,15 +82,33 @@ describe("HtmlPlaywrightMiddleware", () => {
   it("should render simple HTML and update context.content and context.dom", async () => {
     const initialHtml =
       "<html><head><title>Initial</title></head><body><p>Hello</p><script>document.querySelector('p').textContent = 'Hello Playwright!';</script></body></html>";
+    const renderedHtml =
+      "<html><head><title>Initial</title></head><body><p>Hello Playwright!</p></body></html>";
     const context = createPipelineTestContext(
       initialHtml,
       // Using a unique domain helps isolate Playwright's network interception
       "https://example-f8b6e5ad.com/test",
     ); // Set a source URL for the context
 
-    // Create a pipeline with only the Playwright middleware for this test
-    // We need to pass the context through the middleware directly, not a pipeline
-    const next = vi.fn(); // Mock the next function
+    // Stub Playwright to avoid launching a real browser
+    const pageSpy = {
+      route: vi.fn().mockResolvedValue(undefined),
+      unroute: vi.fn().mockResolvedValue(undefined),
+      goto: vi.fn().mockResolvedValue(undefined),
+      waitForSelector: vi.fn().mockResolvedValue(undefined),
+      isVisible: vi.fn().mockResolvedValue(false),
+      content: vi.fn().mockResolvedValue(renderedHtml),
+      close: vi.fn().mockResolvedValue(undefined),
+    } as unknown as MockedObject<Page>;
+    const browserSpy = {
+      newPage: vi.fn().mockResolvedValue(pageSpy),
+      isConnected: vi.fn().mockReturnValue(true),
+      on: vi.fn(),
+      close: vi.fn().mockResolvedValue(undefined),
+    } as unknown as MockedObject<Browser>;
+    const launchSpy = vi.spyOn(chromium, "launch").mockResolvedValue(browserSpy);
+
+    const next = vi.fn();
     await playwrightMiddleware.process(context, next);
 
     expect(context.errors).toHaveLength(0);
@@ -100,6 +118,8 @@ describe("HtmlPlaywrightMiddleware", () => {
     expect(context.dom).toBeUndefined();
     // Ensure next was called if processing was successful
     expect(next).toHaveBeenCalled();
+
+    launchSpy.mockRestore();
   });
 
   it("should handle invalid HTML without throwing unhandled errors and call next", async () => {

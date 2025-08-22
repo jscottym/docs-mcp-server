@@ -1,14 +1,14 @@
 import { URL } from "node:url";
 import { CancellationError } from "../../pipeline/errors";
 import type { Document, ProgressCallback } from "../../types";
+import { DEFAULT_MAX_PAGES } from "../../utils/config";
 import { logger } from "../../utils/logger";
-import { type UrlNormalizerOptions, normalizeUrl } from "../../utils/url";
+import { normalizeUrl, type UrlNormalizerOptions } from "../../utils/url";
 import type { ScraperOptions, ScraperProgress, ScraperStrategy } from "../types";
 import { shouldIncludeUrl } from "../utils/patternMatcher";
 import { isInScope } from "../utils/scope";
 
 // Define defaults for optional options
-const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_MAX_DEPTH = 3;
 const DEFAULT_CONCURRENCY = 3;
 
@@ -24,6 +24,9 @@ export interface BaseScraperStrategyOptions {
 export abstract class BaseScraperStrategy implements ScraperStrategy {
   protected visited = new Set<string>();
   protected pageCount = 0;
+  protected totalDiscovered = 0; // Track total URLs discovered (unlimited)
+  protected effectiveTotal = 0; // Track effective total (limited by maxPages)
+  protected canonicalBaseUrl?: URL; // Final URL after initial redirect (depth 0)
 
   abstract canHandle(url: string): boolean;
 
@@ -40,7 +43,7 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
   protected shouldProcessUrl(url: string, options: ScraperOptions): boolean {
     if (options.scope) {
       try {
-        const base = new URL(options.url);
+        const base = this.canonicalBaseUrl ?? new URL(options.url);
         const target = new URL(url);
         if (!isInScope(base, target, options.scope)) return false;
       } catch {
@@ -63,6 +66,7 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
   ): Promise<{
     document?: Document;
     links?: string[];
+    finalUrl?: string; // Effective fetched URL (post-redirect)
   }>;
 
   // Removed getProcessor method as processing is now handled by strategies using middleware pipelines
@@ -74,6 +78,7 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
     progressCallback: ProgressCallback<ScraperProgress>,
     signal?: AbortSignal, // Add signal
   ): Promise<QueueItem[]> {
+    const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
     const results = await Promise.all(
       batch.map(async (item) => {
         // Check signal before processing each item in the batch
@@ -89,18 +94,39 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
         try {
           // Pass signal to processItem
           const result = await this.processItem(item, options, undefined, signal);
+          // If this is the root (depth 0) and we have a finalUrl differing from original, set canonicalBaseUrl
+          if (item.depth === 0 && !this.canonicalBaseUrl && result?.finalUrl) {
+            try {
+              const finalUrlStr = result.finalUrl as string;
+              const original = new URL(options.url);
+              const finalUrlObj = new URL(finalUrlStr);
+              if (
+                finalUrlObj.href !== original.href &&
+                (finalUrlObj.protocol === "http:" || finalUrlObj.protocol === "https:")
+              ) {
+                this.canonicalBaseUrl = finalUrlObj;
+                logger.debug(
+                  `Updated scope base after redirect: ${original.href} -> ${finalUrlObj.href}`,
+                );
+              } else {
+                this.canonicalBaseUrl = original;
+              }
+            } catch {
+              // Ignore canonical base errors
+              this.canonicalBaseUrl = new URL(options.url);
+            }
+          }
 
           if (result.document) {
             this.pageCount++;
-            // Resolve defaults for logging and progress callback
-            const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
             // maxDepth already resolved above
             logger.info(
-              `🌐 Scraping page ${this.pageCount}/${maxPages} (depth ${item.depth}/${maxDepth}): ${item.url}`,
+              `🌐 Scraping page ${this.pageCount}/${this.effectiveTotal} (depth ${item.depth}/${maxDepth}): ${item.url}`,
             );
             await progressCallback({
               pagesScraped: this.pageCount,
-              maxPages: maxPages,
+              totalPages: this.effectiveTotal,
+              totalDiscovered: this.totalDiscovered,
               currentUrl: item.url,
               depth: item.depth,
               maxDepth: maxDepth,
@@ -121,7 +147,7 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
                   url: targetUrl.href,
                   depth: item.depth + 1,
                 } satisfies QueueItem;
-              } catch (error) {
+              } catch (_error) {
                 // Invalid URL or path
                 logger.warn(`❌ Invalid URL: ${value}`);
               }
@@ -148,6 +174,14 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
       if (!this.visited.has(normalizedUrl)) {
         this.visited.add(normalizedUrl);
         uniqueLinks.push(item);
+
+        // Always increment the unlimited counter
+        this.totalDiscovered++;
+
+        // Only increment effective total if we haven't exceeded maxPages
+        if (this.effectiveTotal < maxPages) {
+          this.effectiveTotal++;
+        }
       }
     }
 
@@ -161,8 +195,11 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
   ): Promise<void> {
     this.visited.clear();
     this.pageCount = 0;
+    this.totalDiscovered = 1; // Start with the initial URL (unlimited counter)
+    this.effectiveTotal = 1; // Start with the initial URL (limited counter)
 
-    const baseUrl = new URL(options.url);
+    this.canonicalBaseUrl = new URL(options.url);
+    let baseUrl = this.canonicalBaseUrl;
     const queue = [{ url: options.url, depth: 0 } satisfies QueueItem];
 
     // Track values we've seen (either queued or visited)
@@ -193,6 +230,8 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
 
       const batch = queue.splice(0, batchSize);
       // Pass signal to processBatch
+      // Always use latest canonical base (may have been updated after first fetch)
+      baseUrl = this.canonicalBaseUrl ?? baseUrl;
       const newUrls = await this.processBatch(
         batch,
         baseUrl,

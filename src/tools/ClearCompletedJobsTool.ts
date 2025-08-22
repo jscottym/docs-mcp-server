@@ -1,4 +1,4 @@
-import type { PipelineManager } from "../pipeline/PipelineManager";
+import type { IPipeline } from "../pipeline/trpc/interfaces";
 import { logger } from "../utils/logger";
 
 /**
@@ -26,14 +26,14 @@ export interface ClearCompletedJobsResult {
  * This helps keep the job queue clean by removing jobs that are no longer active.
  */
 export class ClearCompletedJobsTool {
-  private manager: PipelineManager;
+  private pipeline: IPipeline;
 
   /**
    * Creates an instance of ClearCompletedJobsTool.
-   * @param manager The PipelineManager instance.
+   * @param pipeline The pipeline instance.
    */
-  constructor(manager: PipelineManager) {
-    this.manager = manager;
+  constructor(pipeline: IPipeline) {
+    this.pipeline = pipeline;
   }
 
   /**
@@ -41,16 +41,16 @@ export class ClearCompletedJobsTool {
    * @param input - The input parameters (currently unused).
    * @returns A promise that resolves with the outcome of the clear operation.
    */
-  async execute(input: ClearCompletedJobsInput): Promise<ClearCompletedJobsResult> {
+  async execute(_input: ClearCompletedJobsInput): Promise<ClearCompletedJobsResult> {
     try {
-      const clearedCount = await this.manager.clearCompletedJobs();
+      const clearedCount = await this.pipeline.clearCompletedJobs();
 
       const message =
         clearedCount > 0
           ? `Successfully cleared ${clearedCount} completed job${clearedCount === 1 ? "" : "s"} from the queue.`
           : "No completed jobs to clear.";
 
-      logger.debug(`[ClearCompletedJobsTool] ${message}`);
+      logger.debug(message);
 
       return {
         message,
@@ -62,7 +62,7 @@ export class ClearCompletedJobsTool {
         error instanceof Error ? error.message : String(error)
       }`;
 
-      logger.error(`❌ [ClearCompletedJobsTool] ${errorMessage}`);
+      logger.error(`❌ ${errorMessage}`);
 
       return {
         message: errorMessage,

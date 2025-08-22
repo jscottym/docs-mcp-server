@@ -1,3 +1,4 @@
+.DS_Store
 node_modules/
 dist/
 .store/
@@ -5,3 +6,4 @@ public/assets/
 *.log
 .env*
 *.code-workspace
+.tsbuildinfo

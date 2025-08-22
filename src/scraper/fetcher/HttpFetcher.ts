@@ -50,12 +50,18 @@ export class HttpFetcher implements ContentFetcher {
         };
 
         const config: AxiosRequestConfig = {
-          responseType: "arraybuffer", // For handling both text and binary
-          headers,
+          responseType: "arraybuffer",
+          headers: {
+            ...headers,
+            // Override Accept-Encoding to exclude zstd which Axios doesn't handle automatically
+            // This prevents servers from sending zstd-compressed content that would appear as binary garbage
+            "Accept-Encoding": "gzip, deflate, br",
+          },
           timeout: options?.timeout,
           signal: options?.signal, // Pass signal to axios
           // Axios follows redirects by default, we need to explicitly disable it if needed
           maxRedirects: followRedirects ? 5 : 0,
+          decompress: true,
         };
 
         const response = await axios.get(source, config);
@@ -64,12 +70,35 @@ export class HttpFetcher implements ContentFetcher {
         const { mimeType, charset } = MimeTypeUtils.parseContentType(contentTypeHeader);
         const contentEncoding = response.headers["content-encoding"];
 
+        // Convert ArrayBuffer to Buffer properly
+        let content: Buffer;
+        if (response.data instanceof ArrayBuffer) {
+          content = Buffer.from(response.data);
+        } else if (Buffer.isBuffer(response.data)) {
+          content = response.data;
+        } else if (typeof response.data === "string") {
+          content = Buffer.from(response.data, "utf-8");
+        } else {
+          // Fallback for other data types
+          content = Buffer.from(response.data);
+        }
+
+        // Determine the final effective URL after redirects (if any)
+        const finalUrl =
+          // Node follow-redirects style
+          response.request?.res?.responseUrl ||
+          // Some adapters may expose directly
+          response.request?.responseUrl ||
+          // Fallback to axios recorded config URL
+          response.config?.url ||
+          source;
+
         return {
-          content: response.data,
+          content,
           mimeType,
           charset,
           encoding: contentEncoding,
-          source: source,
+          source: finalUrl,
         } satisfies RawContent;
       } catch (error: unknown) {
         const axiosError = error as AxiosError;

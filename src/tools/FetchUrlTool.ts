@@ -7,6 +7,8 @@ import type {
 import { HtmlPipeline } from "../scraper/pipelines/HtmlPipeline";
 import { MarkdownPipeline } from "../scraper/pipelines/MarkdownPipeline";
 import { ScrapeMode } from "../scraper/types";
+import { convertToString } from "../scraper/utils/buffer";
+import { resolveCharset } from "../scraper/utils/charset";
 import { ScraperError } from "../utils/errors";
 import { logger } from "../utils/logger";
 import { ToolError } from "./errors";
@@ -67,7 +69,7 @@ export class FetchUrlTool {
     const { url, scrapeMode = ScrapeMode.Auto, headers } = options;
 
     const canFetchResults = this.fetchers.map((f) => f.canFetch(url));
-    const fetcherIndex = canFetchResults.findIndex((result) => result === true);
+    const fetcherIndex = canFetchResults.indexOf(true);
     if (fetcherIndex === -1) {
       throw new ToolError(
         `Invalid URL: ${url}. Must be an HTTP/HTTPS URL or a file:// URL.`,
@@ -119,10 +121,13 @@ export class FetchUrlTool {
         logger.warn(
           `⚠️  Unsupported content type "${rawContent.mimeType}" for ${url}. Returning raw content.`,
         );
-        const contentString =
-          typeof rawContent.content === "string"
-            ? rawContent.content
-            : Buffer.from(rawContent.content).toString("utf-8");
+        // Use proper charset detection for unsupported content types
+        const resolvedCharset = resolveCharset(
+          rawContent.charset,
+          rawContent.content,
+          rawContent.mimeType,
+        );
+        const contentString = convertToString(rawContent.content, resolvedCharset);
         return contentString;
       }
 

@@ -1,4 +1,4 @@
-import { type Mock, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { PipelineManager } from "../pipeline/PipelineManager";
 import { type PipelineJob, PipelineJobStatus } from "../pipeline/types";
 import type { ScraperOptions } from "../scraper/types";
@@ -40,6 +40,8 @@ describe("CancelJobTool", () => {
     completionPromise: Promise.resolve(),
     resolveCompletion: () => {},
     rejectCompletion: () => {},
+    sourceUrl: "url1",
+    scraperOptions: null,
   });
 
   const mockJobsMap = new Map<string, PipelineJob>([

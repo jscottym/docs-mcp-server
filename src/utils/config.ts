@@ -12,7 +12,7 @@ export const DEFAULT_MAX_DEPTH = 3;
 export const DEFAULT_MAX_CONCURRENCY = 3;
 
 /** Default protocol for the MCP server */
-export const DEFAULT_PROTOCOL = "stdio";
+export const DEFAULT_PROTOCOL = "auto";
 
 /** Default port for the HTTP protocol */
 export const DEFAULT_HTTP_PORT = 6280;
@@ -46,6 +46,13 @@ export const SPLITTER_MAX_CHUNK_SIZE = 5000;
  * Maximum number of documents to process in a single batch for embeddings.
  */
 export const EMBEDDING_BATCH_SIZE = 100;
+
+/**
+ * Maximum total character size for a single embedding batch request.
+ * This prevents "413 Request entity too large" errors from embedding APIs.
+ * Default is 50000 (~50KB), can be overridden with DOCS_MCP_EMBEDDING_BATCH_CHARS environment variable.
+ */
+export const EMBEDDING_BATCH_CHARS = 50000;
 
 /**
  * Maximum number of retries for database migrations if busy.

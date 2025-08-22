@@ -3,16 +3,24 @@ import type { Embeddings } from "@langchain/core/embeddings";
 import Database, { type Database as DatabaseType } from "better-sqlite3";
 import semver from "semver";
 import * as sqliteVec from "sqlite-vec";
+import type { ScraperOptions } from "../scraper/types";
 import type { DocumentMetadata } from "../types";
-import { EMBEDDING_BATCH_SIZE } from "../utils/config";
+import { EMBEDDING_BATCH_CHARS, EMBEDDING_BATCH_SIZE } from "../utils/config";
+import { logger } from "../utils/logger";
 import { applyMigrations } from "./applyMigrations";
 import { ConnectionError, DimensionError, StoreError } from "./errors";
-import { VECTOR_DIMENSION } from "./types";
+import type { StoredScraperOptions } from "./types";
 import {
   type DbDocument,
   type DbQueryResult,
-  type LibraryVersionDetails,
+  type DbVersion,
+  type DbVersionWithLibrary,
+  denormalizeVersionName,
   mapDbDocumentToDocument,
+  normalizeVersionName,
+  VECTOR_DIMENSION,
+  type VersionScraperOptions,
+  type VersionStatus,
 } from "./types";
 
 interface RawSearchResult extends DbDocument {
@@ -38,17 +46,41 @@ export class DocumentStore {
   private readonly dbDimension: number = VECTOR_DIMENSION;
   private modelDimension!: number;
   private statements!: {
-    getById: Database.Statement;
-    insertDocument: Database.Statement;
-    insertEmbedding: Database.Statement;
-    deleteDocuments: Database.Statement;
-    queryVersions: Database.Statement;
-    checkExists: Database.Statement;
-    queryLibraryVersions: Database.Statement<[]>; // Updated type
-    getChildChunks: Database.Statement;
-    getPrecedingSiblings: Database.Statement;
-    getSubsequentSiblings: Database.Statement;
-    getParentChunk: Database.Statement;
+    getById: Database.Statement<[bigint]>;
+    insertDocument: Database.Statement<
+      [bigint, bigint, string, string, string, number, string]
+    >;
+    insertEmbedding: Database.Statement<[bigint, bigint, bigint, string]>;
+    deleteDocuments: Database.Statement<[string, string, string]>;
+    deleteDocumentsByUrl: Database.Statement<[string, string, string, string]>;
+    queryVersions: Database.Statement<[string]>;
+    checkExists: Database.Statement<[string, string]>;
+    queryLibraryVersions: Database.Statement<[]>;
+    getChildChunks: Database.Statement<
+      [string, string, string, number, string, bigint, number]
+    >;
+    getPrecedingSiblings: Database.Statement<
+      [string, string, string, bigint, string, number]
+    >;
+    getSubsequentSiblings: Database.Statement<
+      [string, string, string, bigint, string, number]
+    >;
+    getParentChunk: Database.Statement<[string, string, string, string, bigint]>;
+    insertLibrary: Database.Statement<[string]>;
+    getLibraryIdByName: Database.Statement<[string]>;
+    // New version-related statements
+    insertVersion: Database.Statement<[number, string | null]>;
+    resolveVersionId: Database.Statement<[number, string | null]>;
+    getVersionById: Database.Statement<[number]>;
+    queryVersionsByLibraryId: Database.Statement<[number]>;
+    // Status tracking statements
+    updateVersionStatus: Database.Statement<[string, string | null, number]>;
+    updateVersionProgress: Database.Statement<[number, number, number]>;
+    getVersionsByStatus: Database.Statement<string[]>;
+    // Scraper options statements
+    updateVersionScraperOptions: Database.Statement<[string, string, number]>;
+    getVersionWithOptions: Database.Statement<[number]>;
+    getVersionsBySourceUrl: Database.Statement<[string]>;
   };
 
   /**
@@ -76,7 +108,7 @@ export class DocumentStore {
     // Sort by vector scores and assign ranks
     results
       .filter((r) => r.vec_score !== undefined)
-      .sort((a, b) => (a.vec_score ?? 0) - (b.vec_score ?? 0))
+      .sort((a, b) => (b.vec_score ?? 0) - (a.vec_score ?? 0))
       .forEach((result, index) => {
         vecRanks.set(Number(result.id), index + 1);
       });
@@ -84,7 +116,7 @@ export class DocumentStore {
     // Sort by BM25 scores and assign ranks
     results
       .filter((r) => r.fts_score !== undefined)
-      .sort((a, b) => (a.fts_score ?? 0) - (b.fts_score ?? 0))
+      .sort((a, b) => (b.fts_score ?? 0) - (a.fts_score ?? 0))
       .forEach((result, index) => {
         ftsRanks.set(Number(result.id), index + 1);
       });
@@ -115,74 +147,178 @@ export class DocumentStore {
    */
   private prepareStatements(): void {
     const statements = {
-      getById: this.db.prepare("SELECT * FROM documents WHERE id = ?"),
-      insertDocument: this.db.prepare(
-        "INSERT INTO documents (library, version, url, content, metadata, sort_order, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", // Added indexed_at
+      getById: this.db.prepare<[bigint]>("SELECT * FROM documents WHERE id = ?"),
+      insertDocument: this.db.prepare<
+        [bigint, bigint, string, string, string, number, string]
+      >(
+        "INSERT INTO documents (library_id, version_id, url, content, metadata, sort_order, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       ),
-      insertEmbedding: this.db.prepare<[number, string]>(
-        "INSERT INTO documents_vec (rowid, library, version, embedding) VALUES (?, ?, ?, ?)",
+      insertEmbedding: this.db.prepare<[bigint, bigint, bigint, string]>(
+        "INSERT INTO documents_vec (rowid, library_id, version_id, embedding) VALUES (?, ?, ?, ?)",
       ),
-      deleteDocuments: this.db.prepare(
-        "DELETE FROM documents WHERE library = ? AND version = ?",
+      insertLibrary: this.db.prepare<[string]>(
+        "INSERT INTO libraries (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
       ),
-      queryVersions: this.db.prepare(
-        "SELECT DISTINCT version FROM documents WHERE library = ? ORDER BY version",
+      getLibraryIdByName: this.db.prepare<[string]>(
+        "SELECT id FROM libraries WHERE name = ?",
       ),
-      checkExists: this.db.prepare(
-        "SELECT id FROM documents WHERE library = ? AND version = ? LIMIT 1",
+      // New version-related statements
+      insertVersion: this.db.prepare<[number, string | null]>(
+        "INSERT INTO versions (library_id, name, status) VALUES (?, ?, 'not_indexed') ON CONFLICT(library_id, name) DO NOTHING",
       ),
-      queryLibraryVersions: this.db.prepare(
+      resolveVersionId: this.db.prepare<[number, string | null]>(
+        "SELECT id FROM versions WHERE library_id = ? AND name IS ?",
+      ),
+      getVersionById: this.db.prepare<[number]>("SELECT * FROM versions WHERE id = ?"),
+      queryVersionsByLibraryId: this.db.prepare<[number]>(
+        "SELECT * FROM versions WHERE library_id = ? ORDER BY name",
+      ),
+      deleteLibraryDocuments: this.db.prepare<[string, string, string]>(
+        `DELETE FROM documents
+         WHERE library_id = (SELECT id FROM libraries WHERE name = ?)
+         AND version_id = (
+           SELECT v.id FROM versions v 
+           WHERE v.library_id = (SELECT id FROM libraries WHERE name = ?)
+           AND COALESCE(v.name, '') = COALESCE(?, '')
+         )`,
+      ),
+      deleteDocuments: this.db.prepare<[string, string, string]>(
+        `DELETE FROM documents
+         WHERE library_id = (SELECT id FROM libraries WHERE name = ?)
+         AND version_id = (
+           SELECT v.id FROM versions v 
+           WHERE v.library_id = (SELECT id FROM libraries WHERE name = ?)
+           AND COALESCE(v.name, '') = COALESCE(?, '')
+         )`,
+      ),
+      deleteDocumentsByUrl: this.db.prepare<[string, string, string, string]>(
+        `DELETE FROM documents
+         WHERE url = ?
+         AND library_id = (SELECT id FROM libraries WHERE name = ?)
+         AND version_id = (
+           SELECT v.id FROM versions v 
+           WHERE v.library_id = (SELECT id FROM libraries WHERE name = ?)
+           AND COALESCE(v.name, '') = COALESCE(?, '')
+         )`,
+      ),
+      getDocumentBySort: this.db.prepare<[string, string]>(
+        `SELECT d.id
+         FROM documents d
+         JOIN versions v ON d.version_id = v.id
+         JOIN libraries l ON v.library_id = l.id
+         WHERE l.name = ?
+         AND COALESCE(v.name, '') = COALESCE(?, '')
+         LIMIT 1`,
+      ),
+      queryVersions: this.db.prepare<[string]>(
+        `SELECT DISTINCT v.name
+         FROM versions v
+         JOIN libraries l ON v.library_id = l.id
+         WHERE l.name = ?
+         ORDER BY v.name`,
+      ),
+      checkExists: this.db.prepare<[string, string]>(
+        `SELECT d.id FROM documents d
+         JOIN versions v ON d.version_id = v.id
+         JOIN libraries l ON v.library_id = l.id
+         WHERE l.name = ?
+         AND COALESCE(v.name, '') = COALESCE(?, '')
+         LIMIT 1`,
+      ),
+      // Library/version aggregation including versions without documents and status/progress fields
+      queryLibraryVersions: this.db.prepare<[]>(
         `SELECT
-          library,
-          version,
-          COUNT(*) as documentCount,
-          COUNT(DISTINCT url) as uniqueUrlCount,
-          MIN(indexed_at) as indexedAt
-        FROM documents
-        GROUP BY library, version
-        ORDER BY library, version`,
+          l.name as library,
+          COALESCE(v.name, '') as version,
+          v.id as versionId,
+          v.status as status,
+          v.progress_pages as progressPages,
+          v.progress_max_pages as progressMaxPages,
+          v.source_url as sourceUrl,
+          MIN(d.indexed_at) as indexedAt,
+          COUNT(d.id) as documentCount,
+          COUNT(DISTINCT d.url) as uniqueUrlCount
+        FROM versions v
+        JOIN libraries l ON v.library_id = l.id
+        LEFT JOIN documents d ON d.version_id = v.id
+        GROUP BY v.id
+        ORDER BY l.name, version`,
       ),
-      getChildChunks: this.db.prepare(`
-        SELECT * FROM documents
-        WHERE library = ? 
-        AND version = ? 
-        AND url = ?
-        AND json_array_length(json_extract(metadata, '$.path')) = ?
-        AND json_extract(metadata, '$.path') LIKE ? || '%'
-        AND sort_order > (SELECT sort_order FROM documents WHERE id = ?)
-        ORDER BY sort_order
+      getChildChunks: this.db.prepare<
+        [string, string, string, number, string, bigint, number]
+      >(`
+        SELECT d.* FROM documents d
+        JOIN versions v ON d.version_id = v.id
+        JOIN libraries l ON v.library_id = l.id
+        WHERE l.name = ?
+        AND COALESCE(v.name, '') = COALESCE(?, '')
+        AND d.url = ?
+        AND json_array_length(json_extract(d.metadata, '$.path')) = ?
+        AND json_extract(d.metadata, '$.path') LIKE ? || '%'
+        AND d.sort_order > (SELECT sort_order FROM documents WHERE id = ?)
+        ORDER BY d.sort_order
         LIMIT ?
       `),
-      getPrecedingSiblings: this.db.prepare(`
-        SELECT * FROM documents 
-        WHERE library = ? 
-        AND version = ? 
-        AND url = ?
-        AND sort_order < (SELECT sort_order FROM documents WHERE id = ?)
-        AND json_extract(metadata, '$.path') = ?
-        ORDER BY sort_order DESC
+      getPrecedingSiblings: this.db.prepare<
+        [string, string, string, bigint, string, number]
+      >(`
+        SELECT d.* FROM documents d
+        JOIN versions v ON d.version_id = v.id
+        JOIN libraries l ON v.library_id = l.id
+        WHERE l.name = ?
+        AND COALESCE(v.name, '') = COALESCE(?, '')
+        AND d.url = ?
+        AND d.sort_order < (SELECT sort_order FROM documents WHERE id = ?)
+        AND json_extract(d.metadata, '$.path') = ?
+        ORDER BY d.sort_order DESC
         LIMIT ?
       `),
-      getSubsequentSiblings: this.db.prepare(`
-        SELECT * FROM documents 
-        WHERE library = ? 
-        AND version = ? 
-        AND url = ?
-        AND sort_order > (SELECT sort_order FROM documents WHERE id = ?)
-        AND json_extract(metadata, '$.path') = ?
-        ORDER BY sort_order
+      getSubsequentSiblings: this.db.prepare<
+        [string, string, string, bigint, string, number]
+      >(`
+        SELECT d.* FROM documents d
+        JOIN versions v ON d.version_id = v.id
+        JOIN libraries l ON v.library_id = l.id
+        WHERE l.name = ?
+        AND COALESCE(v.name, '') = COALESCE(?, '')
+        AND d.url = ?
+        AND d.sort_order > (SELECT sort_order FROM documents WHERE id = ?)
+        AND json_extract(d.metadata, '$.path') = ?
+        ORDER BY d.sort_order
         LIMIT ?
       `),
-      getParentChunk: this.db.prepare(`
-        SELECT * FROM documents 
-        WHERE library = ? 
-        AND version = ? 
-        AND url = ?
-        AND json_extract(metadata, '$.path') = ?
-        AND sort_order < (SELECT sort_order FROM documents WHERE id = ?)
-        ORDER BY sort_order DESC
+      getParentChunk: this.db.prepare<[string, string, string, string, bigint]>(`
+        SELECT d.* FROM documents d
+        JOIN versions v ON d.version_id = v.id
+        JOIN libraries l ON v.library_id = l.id
+        WHERE l.name = ?
+        AND COALESCE(v.name, '') = COALESCE(?, '')
+        AND d.url = ?
+        AND json_extract(d.metadata, '$.path') = ?
+        AND d.sort_order < (SELECT sort_order FROM documents WHERE id = ?)
+        ORDER BY d.sort_order DESC
         LIMIT 1
       `),
+      // Status tracking statements
+      updateVersionStatus: this.db.prepare<[string, string | null, number]>(
+        "UPDATE versions SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      ),
+      updateVersionProgress: this.db.prepare<[number, number, number]>(
+        "UPDATE versions SET progress_pages = ?, progress_max_pages = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      ),
+      getVersionsByStatus: this.db.prepare<[string]>(
+        "SELECT v.*, l.name as library_name FROM versions v JOIN libraries l ON v.library_id = l.id WHERE v.status IN (SELECT value FROM json_each(?))",
+      ),
+      // Scraper options statements
+      updateVersionScraperOptions: this.db.prepare<[string, string, number]>(
+        "UPDATE versions SET source_url = ?, scraper_options = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      ),
+      getVersionWithOptions: this.db.prepare<[number]>(
+        "SELECT * FROM versions WHERE id = ?",
+      ),
+      getVersionsBySourceUrl: this.db.prepare<[string]>(
+        "SELECT v.*, l.name as library_name FROM versions v JOIN libraries l ON v.library_id = l.id WHERE v.source_url = ? ORDER BY v.created_at DESC",
+      ),
     };
     this.statements = statements;
   }
@@ -276,16 +412,170 @@ export class DocumentStore {
   }
 
   /**
+   * Resolves a library name and version string to library_id and version_id.
+   * Creates library and version records if they don't exist.
+   */
+  async resolveLibraryAndVersionIds(
+    library: string,
+    version: string,
+  ): Promise<{ libraryId: number; versionId: number }> {
+    const normalizedLibrary = library.toLowerCase();
+    const normalizedVersion = denormalizeVersionName(version.toLowerCase());
+
+    // Insert or get library_id
+    this.statements.insertLibrary.run(normalizedLibrary);
+    const libraryIdRow = this.statements.getLibraryIdByName.get(normalizedLibrary) as
+      | { id: number }
+      | undefined;
+    if (!libraryIdRow || typeof libraryIdRow.id !== "number") {
+      throw new StoreError(`Failed to resolve library_id for library: ${library}`);
+    }
+    const libraryId = libraryIdRow.id;
+
+    // Insert or get version_id
+    // Reuse existing unversioned entry if present; storing '' ensures UNIQUE constraint applies
+    this.statements.insertVersion.run(libraryId, normalizedVersion);
+    const versionIdRow = this.statements.resolveVersionId.get(
+      libraryId,
+      normalizedVersion === null ? "" : normalizedVersion,
+    ) as { id: number } | undefined;
+    if (!versionIdRow || typeof versionIdRow.id !== "number") {
+      throw new StoreError(
+        `Failed to resolve version_id for library: ${library}, version: ${version}`,
+      );
+    }
+
+    return { libraryId, versionId: versionIdRow.id };
+  }
+
+  /**
    * Retrieves all unique versions for a specific library
    */
   async queryUniqueVersions(library: string): Promise<string[]> {
     try {
-      const rows = this.statements.queryVersions.all(library.toLowerCase()) as Array<
-        Pick<DbDocument, "version">
-      >;
-      return rows.map((row) => row.version);
+      const rows = this.statements.queryVersions.all(library.toLowerCase()) as Array<{
+        name: string | null;
+      }>;
+      return rows.map((row) => normalizeVersionName(row.name));
     } catch (error) {
       throw new ConnectionError("Failed to query versions", error);
+    }
+  }
+
+  /**
+   * Updates the status of a version record in the database.
+   * @param versionId The version ID to update
+   * @param status The new status to set
+   * @param errorMessage Optional error message for failed statuses
+   */
+  async updateVersionStatus(
+    versionId: number,
+    status: VersionStatus,
+    errorMessage?: string,
+  ): Promise<void> {
+    try {
+      this.statements.updateVersionStatus.run(status, errorMessage ?? null, versionId);
+    } catch (error) {
+      throw new StoreError(`Failed to update version status: ${error}`);
+    }
+  }
+
+  /**
+   * Updates the progress counters for a version being indexed.
+   * @param versionId The version ID to update
+   * @param pages Current number of pages processed
+   * @param maxPages Total number of pages to process
+   */
+  async updateVersionProgress(
+    versionId: number,
+    pages: number,
+    maxPages: number,
+  ): Promise<void> {
+    try {
+      this.statements.updateVersionProgress.run(pages, maxPages, versionId);
+    } catch (error) {
+      throw new StoreError(`Failed to update version progress: ${error}`);
+    }
+  }
+
+  /**
+   * Retrieves versions by their status.
+   * @param statuses Array of statuses to filter by
+   * @returns Array of version records matching the statuses
+   */
+  async getVersionsByStatus(statuses: VersionStatus[]): Promise<DbVersionWithLibrary[]> {
+    try {
+      const statusJson = JSON.stringify(statuses);
+      const rows = this.statements.getVersionsByStatus.all(
+        statusJson,
+      ) as DbVersionWithLibrary[];
+      return rows;
+    } catch (error) {
+      throw new StoreError(`Failed to get versions by status: ${error}`);
+    }
+  }
+
+  /**
+   * Stores scraper options for a version to enable reproducible indexing.
+   * @param versionId The version ID to update
+   * @param options Complete scraper options used for indexing
+   */
+  async storeScraperOptions(versionId: number, options: ScraperOptions): Promise<void> {
+    try {
+      // biome-ignore lint/correctness/noUnusedVariables: Extract source URL and exclude runtime-only fields using destructuring
+      const { url: source_url, library, version, signal, ...scraper_options } = options;
+
+      const optionsJson = JSON.stringify(scraper_options);
+      this.statements.updateVersionScraperOptions.run(source_url, optionsJson, versionId);
+    } catch (error) {
+      throw new StoreError(`Failed to store scraper options: ${error}`);
+    }
+  }
+
+  /**
+   * Retrieves stored scraping configuration (source URL and options) for a version.
+   * Returns null when no source URL is recorded (not re-indexable).
+   */
+  async getScraperOptions(versionId: number): Promise<StoredScraperOptions | null> {
+    try {
+      const row = this.statements.getVersionWithOptions.get(versionId) as
+        | DbVersion
+        | undefined;
+
+      if (!row?.source_url) {
+        return null;
+      }
+
+      let parsed: VersionScraperOptions = {} as VersionScraperOptions;
+      if (row.scraper_options) {
+        try {
+          parsed = JSON.parse(row.scraper_options) as VersionScraperOptions;
+        } catch (e) {
+          logger.warn(`⚠️ Invalid scraper_options JSON for version ${versionId}: ${e}`);
+          parsed = {} as VersionScraperOptions;
+        }
+      }
+
+      return { sourceUrl: row.source_url, options: parsed };
+    } catch (error) {
+      throw new StoreError(`Failed to get scraper options: ${error}`);
+    }
+  }
+
+  /**
+   * Finds versions that were indexed from the same source URL.
+   * Useful for finding similar configurations or detecting duplicates.
+   * @param url Source URL to search for
+   * @returns Array of versions with the same source URL
+   */
+  async findVersionsBySourceUrl(url: string): Promise<DbVersionWithLibrary[]> {
+    try {
+      const rows = this.statements.getVersionsBySourceUrl.all(
+        url,
+      ) as DbVersionWithLibrary[];
+      return rows;
+    } catch (error) {
+      throw new StoreError(`Failed to find versions by source URL: ${error}`);
     }
   }
 
@@ -294,9 +584,10 @@ export class DocumentStore {
    */
   async checkDocumentExists(library: string, version: string): Promise<boolean> {
     try {
+      const normalizedVersion = version.toLowerCase();
       const result = this.statements.checkExists.get(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
       );
       return result !== undefined;
     } catch (error) {
@@ -307,19 +598,52 @@ export class DocumentStore {
   /**
    * Retrieves a mapping of all libraries to their available versions with details.
    */
-  async queryLibraryVersions(): Promise<Map<string, LibraryVersionDetails[]>> {
+  async queryLibraryVersions(): Promise<
+    Map<
+      string,
+      Array<{
+        version: string;
+        versionId: number;
+        status: VersionStatus; // Persisted enum value
+        progressPages: number;
+        progressMaxPages: number;
+        sourceUrl: string | null;
+        documentCount: number;
+        uniqueUrlCount: number;
+        indexedAt: string | null;
+      }>
+    >
+  > {
     try {
-      // Define the expected row structure from the GROUP BY query
+      // Define the expected row structure from the GROUP BY query (including versions without documents)
       interface LibraryVersionRow {
         library: string;
         version: string;
+        versionId: number;
+        status: VersionStatus;
+        progressPages: number;
+        progressMaxPages: number;
+        sourceUrl: string | null;
         documentCount: number;
         uniqueUrlCount: number;
-        indexedAt: string | null; // SQLite MIN might return string or null
+        indexedAt: string | null; // MIN() may return null
       }
 
       const rows = this.statements.queryLibraryVersions.all() as LibraryVersionRow[];
-      const libraryMap = new Map<string, LibraryVersionDetails[]>();
+      const libraryMap = new Map<
+        string,
+        Array<{
+          version: string;
+          versionId: number;
+          status: VersionStatus;
+          progressPages: number;
+          progressMaxPages: number;
+          sourceUrl: string | null;
+          documentCount: number;
+          uniqueUrlCount: number;
+          indexedAt: string | null;
+        }>
+      >();
 
       for (const row of rows) {
         // Process all rows, including those where version is "" (unversioned)
@@ -333,6 +657,12 @@ export class DocumentStore {
 
         libraryMap.get(library)?.push({
           version: row.version,
+          versionId: row.versionId,
+          // Preserve raw string status here; DocumentManagementService will cast to VersionStatus
+          status: row.status,
+          progressPages: row.progressPages,
+          progressMaxPages: row.progressMaxPages,
+          sourceUrl: row.sourceUrl,
           documentCount: row.documentCount,
           uniqueUrlCount: row.uniqueUrlCount,
           indexedAt: indexedAtISO,
@@ -351,8 +681,13 @@ export class DocumentStore {
           if (a.version === "" && b.version === "") {
             return 0; // Should not happen with GROUP BY, but handle anyway
           }
-          // Both are non-empty, use semver compare
-          return semver.compare(a.version, b.version);
+          // Both are non-empty, use semver compare with fallback to string compare
+          try {
+            return semver.compare(a.version, b.version);
+          } catch (_error) {
+            // Fallback to lexicographic comparison if semver parsing fails
+            return a.version.localeCompare(b.version);
+          }
         });
       }
 
@@ -364,7 +699,8 @@ export class DocumentStore {
 
   /**
    * Stores documents with library and version metadata, generating embeddings
-   * for vector similarity search
+   * for vector similarity search. Automatically removes any existing documents
+   * for the same URLs before adding new ones to prevent UNIQUE constraint violations.
    */
   async addDocuments(
     library: string,
@@ -372,6 +708,20 @@ export class DocumentStore {
     documents: Document[],
   ): Promise<void> {
     try {
+      if (documents.length === 0) {
+        return;
+      }
+
+      // Extract unique URLs from the documents being added
+      const urls = new Set<string>();
+      for (const doc of documents) {
+        const url = doc.metadata.url as string;
+        if (!url || typeof url !== "string" || !url.trim()) {
+          throw new StoreError("Document metadata must include a valid URL");
+        }
+        urls.add(url);
+      }
+
       // Generate embeddings in batch
       const texts = documents.map((doc) => {
         const header = `<title>${doc.metadata.title}</title>\n<url>${doc.metadata.url}</url>\n<path>${doc.metadata.path.join(" / ")}</path>\n`;
@@ -379,27 +729,83 @@ export class DocumentStore {
       });
 
       // Batch embedding creation to avoid token limit errors
+      // Use size-based batching to prevent 413 errors
+      const maxBatchChars =
+        Number(process.env.DOCS_MCP_EMBEDDING_BATCH_CHARS) || EMBEDDING_BATCH_CHARS;
       const rawEmbeddings: number[][] = [];
-      for (let i = 0; i < texts.length; i += EMBEDDING_BATCH_SIZE) {
-        const batchTexts = texts.slice(i, i + EMBEDDING_BATCH_SIZE);
-        const batchEmbeddings = await this.embeddings.embedDocuments(batchTexts);
+
+      let currentBatch: string[] = [];
+      let currentBatchSize = 0;
+      let batchCount = 0;
+
+      for (const text of texts) {
+        const textSize = text.length;
+
+        // If adding this text would exceed the limit, process the current batch first
+        if (currentBatchSize + textSize > maxBatchChars && currentBatch.length > 0) {
+          batchCount++;
+          logger.debug(
+            `🔄 Processing embedding batch ${batchCount}: ${currentBatch.length} texts, ${currentBatchSize} chars`,
+          );
+          const batchEmbeddings = await this.embeddings.embedDocuments(currentBatch);
+          rawEmbeddings.push(...batchEmbeddings);
+          currentBatch = [];
+          currentBatchSize = 0;
+        }
+
+        // Add text to current batch
+        currentBatch.push(text);
+        currentBatchSize += textSize;
+
+        // Also respect the count-based limit for APIs that have per-request item limits
+        if (currentBatch.length >= EMBEDDING_BATCH_SIZE) {
+          batchCount++;
+          logger.debug(
+            `🔄 Processing embedding batch ${batchCount}: ${currentBatch.length} texts, ${currentBatchSize} chars`,
+          );
+          const batchEmbeddings = await this.embeddings.embedDocuments(currentBatch);
+          rawEmbeddings.push(...batchEmbeddings);
+          currentBatch = [];
+          currentBatchSize = 0;
+        }
+      }
+
+      // Process any remaining texts in the final batch
+      if (currentBatch.length > 0) {
+        batchCount++;
+        logger.debug(
+          `🔄 Processing final embedding batch ${batchCount}: ${currentBatch.length} texts, ${currentBatchSize} chars`,
+        );
+        const batchEmbeddings = await this.embeddings.embedDocuments(currentBatch);
         rawEmbeddings.push(...batchEmbeddings);
       }
       const paddedEmbeddings = rawEmbeddings.map((vector) => this.padVector(vector));
+
+      // Resolve library and version IDs (creates them if they don't exist)
+      const { libraryId, versionId } = await this.resolveLibraryAndVersionIds(
+        library,
+        version,
+      );
+
+      // Delete existing documents for these URLs to prevent UNIQUE constraint violations
+      // This must happen AFTER resolveLibraryAndVersionIds to ensure the library/version exist
+      for (const url of urls) {
+        const deletedCount = await this.deleteDocumentsByUrl(library, version, url);
+        if (deletedCount > 0) {
+          logger.debug(`Deleted ${deletedCount} existing documents for URL: ${url}`);
+        }
+      }
 
       // Insert documents in a transaction
       const transaction = this.db.transaction((docs: typeof documents) => {
         for (let i = 0; i < docs.length; i++) {
           const doc = docs[i];
           const url = doc.metadata.url as string;
-          if (!url || typeof url !== "string" || !url.trim()) {
-            throw new StoreError("Document metadata must include a valid URL");
-          }
 
-          // Insert into main documents table
+          // Insert into main documents table using foreign key IDs
           const result = this.statements.insertDocument.run(
-            library.toLowerCase(),
-            version.toLowerCase(),
+            BigInt(libraryId),
+            BigInt(versionId),
             url,
             doc.pageContent,
             JSON.stringify(doc.metadata),
@@ -408,11 +814,11 @@ export class DocumentStore {
           );
           const rowId = result.lastInsertRowid;
 
-          // Insert into vector table
+          // Insert into vector table using foreign key IDs
           this.statements.insertEmbedding.run(
             BigInt(rowId),
-            library.toLowerCase(),
-            version.toLowerCase(),
+            BigInt(libraryId),
+            BigInt(versionId),
             JSON.stringify(paddedEmbeddings[i]),
           );
         }
@@ -430,13 +836,38 @@ export class DocumentStore {
    */
   async deleteDocuments(library: string, version: string): Promise<number> {
     try {
+      const normalizedVersion = version.toLowerCase();
       const result = this.statements.deleteDocuments.run(
         library.toLowerCase(),
-        version.toLowerCase(),
+        library.toLowerCase(), // library name appears twice in the query
+        normalizedVersion,
       );
       return result.changes;
     } catch (error) {
       throw new ConnectionError("Failed to delete documents", error);
+    }
+  }
+
+  /**
+   * Removes documents for a specific URL within a library and version
+   * @returns Number of documents deleted
+   */
+  async deleteDocumentsByUrl(
+    library: string,
+    version: string,
+    url: string,
+  ): Promise<number> {
+    try {
+      const normalizedVersion = version.toLowerCase();
+      const result = this.statements.deleteDocumentsByUrl.run(
+        url,
+        library.toLowerCase(),
+        library.toLowerCase(), // library name appears twice in the query
+        normalizedVersion,
+      );
+      return result.changes;
+    } catch (error) {
+      throw new ConnectionError("Failed to delete documents by URL", error);
     }
   }
 
@@ -447,7 +878,7 @@ export class DocumentStore {
    */
   async getById(id: string): Promise<Document | null> {
     try {
-      const row = this.statements.getById.get(id) as DbQueryResult<DbDocument>;
+      const row = this.statements.getById.get(BigInt(id)) as DbQueryResult<DbDocument>;
       if (!row) {
         return null;
       }
@@ -472,27 +903,32 @@ export class DocumentStore {
       const rawEmbedding = await this.embeddings.embedQuery(query);
       const embedding = this.padVector(rawEmbedding);
       const ftsQuery = this.escapeFtsQuery(query); // Escape the query for FTS
+      const normalizedVersion = version.toLowerCase();
 
       const stmt = this.db.prepare(`
-        WITH vec_scores AS (
+        WITH vec_distances AS (
           SELECT
-            rowid as id,
-            distance as vec_score
-          FROM documents_vec
-          WHERE library = ?
-            AND version = ?
-            AND embedding MATCH ?
-          ORDER BY vec_score
-          LIMIT ?
+            dv.rowid as id,
+            dv.distance as vec_distance
+          FROM documents_vec dv
+          JOIN versions v ON dv.version_id = v.id
+          JOIN libraries l ON v.library_id = l.id
+          WHERE l.name = ?
+            AND COALESCE(v.name, '') = COALESCE(?, '')
+            AND dv.embedding MATCH ?
+            AND dv.k = ?
+          ORDER BY dv.distance
         ),
         fts_scores AS (
           SELECT
             f.rowid as id,
             bm25(documents_fts, 10.0, 1.0, 5.0, 1.0) as fts_score
           FROM documents_fts f
-          JOIN documents d ON f.rowid = d.rowid
-          WHERE d.library = ?
-            AND d.version = ?
+          JOIN documents d ON f.rowid = d.id
+          JOIN versions v ON d.version_id = v.id
+          JOIN libraries l ON v.library_id = l.id
+          WHERE l.name = ?
+            AND COALESCE(v.name, '') = COALESCE(?, '')
             AND documents_fts MATCH ?
           ORDER BY fts_score
           LIMIT ?
@@ -501,21 +937,21 @@ export class DocumentStore {
           d.id,
           d.content,
           d.metadata,
-          COALESCE(1 / (1 + v.vec_score), 0) as vec_score,
-          COALESCE(1 / (1 + f.fts_score), 0) as fts_score
+          COALESCE(1 / (1 + v.vec_distance), 0) as vec_score,
+          COALESCE(-MIN(f.fts_score, 0), 0) as fts_score
         FROM documents d
-        LEFT JOIN vec_scores v ON d.id = v.id
+        LEFT JOIN vec_distances v ON d.id = v.id
         LEFT JOIN fts_scores f ON d.id = f.id
         WHERE v.id IS NOT NULL OR f.id IS NOT NULL
       `);
 
       const rawResults = stmt.all(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         JSON.stringify(embedding),
         limit,
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         ftsQuery, // Use the escaped query
         limit,
       ) as RawSearchResult[];
@@ -532,6 +968,7 @@ export class DocumentStore {
         ...mapDbDocumentToDocument(row),
         metadata: {
           ...JSON.parse(row.metadata),
+          id: row.id,
           score: row.rrf_score,
           vec_rank: row.vec_rank,
           fts_rank: row.fts_rank,
@@ -562,14 +999,15 @@ export class DocumentStore {
 
       const parentPath = (parent.metadata as DocumentMetadata).path ?? [];
       const parentUrl = (parent.metadata as DocumentMetadata).url;
+      const normalizedVersion = version.toLowerCase();
 
       const result = this.statements.getChildChunks.all(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         parentUrl,
         parentPath.length + 1,
         JSON.stringify(parentPath),
-        id,
+        BigInt(id),
         limit,
       ) as Array<DbDocument>;
 
@@ -595,12 +1033,13 @@ export class DocumentStore {
       }
 
       const refMetadata = reference.metadata as DocumentMetadata;
+      const normalizedVersion = version.toLowerCase();
 
       const result = this.statements.getPrecedingSiblings.all(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         refMetadata.url,
-        id,
+        BigInt(id),
         JSON.stringify(refMetadata.path),
         limit,
       ) as Array<DbDocument>;
@@ -630,12 +1069,13 @@ export class DocumentStore {
       }
 
       const refMetadata = reference.metadata;
+      const normalizedVersion = version.toLowerCase();
 
       const result = this.statements.getSubsequentSiblings.all(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         refMetadata.url,
-        id,
+        BigInt(id),
         JSON.stringify(refMetadata.path),
         limit,
       ) as Array<DbDocument>;
@@ -671,12 +1111,13 @@ export class DocumentStore {
         return null;
       }
 
+      const normalizedVersion = version.toLowerCase();
       const result = this.statements.getParentChunk.get(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         childMetadata.url,
         JSON.stringify(parentPath),
-        id,
+        BigInt(id),
       ) as DbQueryResult<DbDocument>;
 
       if (!result) {
@@ -700,14 +1141,21 @@ export class DocumentStore {
   ): Promise<Document[]> {
     if (!ids.length) return [];
     try {
+      const normalizedVersion = version.toLowerCase();
       // Use parameterized query for variable number of IDs
       const placeholders = ids.map(() => "?").join(",");
       const stmt = this.db.prepare(
-        `SELECT * FROM documents WHERE library = ? AND version = ? AND id IN (${placeholders}) ORDER BY sort_order`,
+        `SELECT d.* FROM documents d
+         JOIN libraries l ON d.library_id = l.id
+         JOIN versions v ON d.version_id = v.id
+         WHERE l.name = ? 
+           AND COALESCE(v.name, '') = COALESCE(?, '')
+           AND d.id IN (${placeholders}) 
+         ORDER BY d.sort_order`,
       );
       const rows = stmt.all(
         library.toLowerCase(),
-        version.toLowerCase(),
+        normalizedVersion,
         ...ids,
       ) as DbDocument[];
       return rows.map((row) => mapDbDocumentToDocument(row));

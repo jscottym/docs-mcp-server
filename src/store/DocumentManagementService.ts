@@ -4,6 +4,7 @@ import type { Document } from "@langchain/core/documents";
 import envPaths from "env-paths";
 import Fuse from "fuse.js";
 import semver from "semver";
+import type { ScraperOptions } from "../scraper/types";
 import { GreedySplitter, SemanticMarkdownSplitter } from "../splitter";
 import type { ContentChunk, DocumentSplitter } from "../splitter/types";
 import { LibraryNotFoundError, VersionNotFoundError } from "../tools";
@@ -18,10 +19,14 @@ import { DocumentRetrieverService } from "./DocumentRetrieverService";
 import { DocumentStore } from "./DocumentStore";
 import { StoreError } from "./errors";
 import type {
+  DbVersionWithLibrary,
   FindVersionResult,
-  LibraryVersion,
-  LibraryVersionDetails,
+  LibrarySummary,
+  ScraperConfig,
   StoreSearchResult,
+  VersionRef,
+  VersionStatus,
+  VersionSummary,
 } from "./types";
 
 /**
@@ -49,7 +54,7 @@ export class DocumentManagementService {
     if (envStorePath) {
       dbDir = envStorePath;
       dbPath = path.join(dbDir, "documents.db");
-      logger.debug(`💾 Using database directory from DOCS_MCP_STORE_PATH: ${dbDir}`);
+      logger.debug(`Using database directory from DOCS_MCP_STORE_PATH: ${dbDir}`);
     } else {
       // 2. Check Old Local Path
       const projectRoot = getProjectRoot();
@@ -60,13 +65,13 @@ export class DocumentManagementService {
       if (oldDbExists) {
         dbPath = oldDbPath;
         dbDir = oldDbDir;
-        logger.debug(`💾 Using legacy database path: ${dbPath}`);
+        logger.debug(`Using legacy database path: ${dbPath}`);
       } else {
         // 3. Use Standard Path
         const standardPaths = envPaths("docs-mcp-server", { suffix: "" });
         dbDir = standardPaths.data;
         dbPath = path.join(dbDir, "documents.db");
-        logger.debug(`💾 Using standard database directory: ${dbDir}`);
+        logger.debug(`Using standard database directory: ${dbDir}`);
       }
     }
 
@@ -109,6 +114,102 @@ export class DocumentManagementService {
   async shutdown(): Promise<void> {
     logger.debug("Shutting down store manager");
     await this.store.shutdown();
+  }
+
+  // Status tracking methods for pipeline integration
+
+  /**
+   * Gets versions by their current status.
+   */
+  async getVersionsByStatus(statuses: VersionStatus[]): Promise<DbVersionWithLibrary[]> {
+    return this.store.getVersionsByStatus(statuses);
+  }
+
+  /**
+   * Updates the status of a version.
+   */
+  async updateVersionStatus(
+    versionId: number,
+    status: VersionStatus,
+    errorMessage?: string,
+  ): Promise<void> {
+    return this.store.updateVersionStatus(versionId, status, errorMessage);
+  }
+
+  /**
+   * Updates the progress of a version being indexed.
+   */
+  async updateVersionProgress(
+    versionId: number,
+    pages: number,
+    maxPages: number,
+  ): Promise<void> {
+    return this.store.updateVersionProgress(versionId, pages, maxPages);
+  }
+
+  /**
+   * Stores scraper options for a version to enable reproducible indexing.
+   */
+  async storeScraperOptions(versionId: number, options: ScraperOptions): Promise<void> {
+    return this.store.storeScraperOptions(versionId, options);
+  }
+
+  /**
+   * Retrieves stored scraper options for a version.
+   */
+  /**
+   * Retrieves stored scraping configuration for a version.
+   */
+  async getScraperOptions(versionId: number): Promise<ScraperConfig | null> {
+    return this.store.getScraperOptions(versionId);
+  }
+
+  /**
+   * Ensures a library/version exists using a VersionRef and returns version ID.
+   * Delegates to existing ensureLibraryAndVersion for storage.
+   */
+  async ensureVersion(ref: VersionRef): Promise<number> {
+    const normalized = {
+      library: ref.library.trim().toLowerCase(),
+      version: (ref.version ?? "").trim().toLowerCase(),
+    };
+    return this.ensureLibraryAndVersion(normalized.library, normalized.version);
+  }
+
+  /**
+   * Returns enriched library summaries including version status/progress and counts.
+   * Uses existing store APIs; keeps DB details encapsulated.
+   */
+  async listLibraries(): Promise<LibrarySummary[]> {
+    const libMap = await this.store.queryLibraryVersions();
+    const summaries: LibrarySummary[] = [];
+    for (const [library, versions] of libMap) {
+      const vs = versions.map(
+        (v) =>
+          ({
+            id: v.versionId,
+            ref: { library, version: v.version },
+            status: v.status as VersionStatus,
+            // Include progress only while indexing is active; set undefined for COMPLETED
+            progress:
+              v.status === "completed"
+                ? undefined
+                : { pages: v.progressPages, maxPages: v.progressMaxPages },
+            counts: { documents: v.documentCount, uniqueUrls: v.uniqueUrlCount },
+            indexedAt: v.indexedAt,
+            sourceUrl: v.sourceUrl ?? undefined,
+          }) satisfies VersionSummary,
+      );
+      summaries.push({ library, versions: vs });
+    }
+    return summaries;
+  }
+
+  /**
+   * Finds versions that were indexed from the same source URL.
+   */
+  async findVersionsBySourceUrl(url: string): Promise<DbVersionWithLibrary[]> {
+    return this.store.findVersionsBySourceUrl(url);
   }
 
   /**
@@ -155,9 +256,9 @@ export class DocumentManagementService {
   /**
    * Returns a list of all available semantic versions for a library.
    */
-  async listVersions(library: string): Promise<LibraryVersion[]> {
+  async listVersions(library: string): Promise<string[]> {
     const versions = await this.store.queryUniqueVersions(library);
-    return versions.filter((v) => semver.valid(v)).map((version) => ({ version }));
+    return versions.filter((v) => semver.valid(v));
   }
 
   /**
@@ -186,15 +287,14 @@ export class DocumentManagementService {
     library: string,
     targetVersion?: string,
   ): Promise<FindVersionResult> {
-    logger.info(
-      `🔍 Finding best version for ${library}${targetVersion ? `@${targetVersion}` : ""}`,
-    );
+    const libraryAndVersion = `${library}${targetVersion ? `@${targetVersion}` : ""}`;
+    logger.info(`🔍 Finding best version for ${libraryAndVersion}`);
 
     // Check if unversioned documents exist *before* filtering for valid semver
     const hasUnversioned = await this.store.checkDocumentExists(library, "");
-    const validSemverVersions = await this.listVersions(library);
+    const versionStrings = await this.listVersions(library);
 
-    if (validSemverVersions.length === 0) {
+    if (versionStrings.length === 0) {
       if (hasUnversioned) {
         logger.info(`ℹ️ Unversioned documents exist for ${library}`);
         return { bestMatch: null, hasUnversioned: true };
@@ -207,7 +307,6 @@ export class DocumentManagementService {
       throw new VersionNotFoundError(library, targetVersion ?? "", libraryDetails);
     }
 
-    const versionStrings = validSemverVersions.map((v) => v.version);
     let bestMatch: string | null = null;
 
     if (!targetVersion || targetVersion === "latest") {
@@ -233,11 +332,9 @@ export class DocumentManagementService {
     }
 
     if (bestMatch) {
-      logger.info(
-        `✅ Found best match version ${bestMatch} for ${library}@${targetVersion}`,
-      );
+      logger.info(`✅ Found best match version ${bestMatch} for ${libraryAndVersion}`);
     } else {
-      logger.warn(`⚠️  No matching semver version found for ${library}@${targetVersion}`);
+      logger.warn(`⚠️  No matching semver version found for ${libraryAndVersion}`);
     }
 
     // If no semver match found, but unversioned exists, return that info.
@@ -322,16 +419,23 @@ export class DocumentManagementService {
     return this.documentRetriever.search(library, normalizedVersion, query, limit);
   }
 
-  async listLibraries(): Promise<
-    Array<{ library: string; versions: LibraryVersionDetails[] }>
-  > {
-    // queryLibraryVersions now returns the detailed map directly
-    const libraryMap = await this.store.queryLibraryVersions();
+  // Deprecated simple listing removed: enriched listLibraries() is canonical
 
-    // Transform the map into the desired array structure
-    return Array.from(libraryMap.entries()).map(([library, versions]) => ({
-      library,
-      versions, // The versions array already contains LibraryVersionDetails
-    }));
+  /**
+   * Ensures a library and version exist in the database and returns the version ID.
+   * Creates the library and version records if they don't exist.
+   */
+  async ensureLibraryAndVersion(library: string, version: string): Promise<number> {
+    // Use the same resolution logic as addDocuments but return the version ID
+    const normalizedLibrary = library.toLowerCase();
+    const normalizedVersion = this.normalizeVersion(version);
+
+    // This will create the library and version if they don't exist
+    const { versionId } = await this.store.resolveLibraryAndVersionIds(
+      normalizedLibrary,
+      normalizedVersion,
+    );
+
+    return versionId;
   }
 }

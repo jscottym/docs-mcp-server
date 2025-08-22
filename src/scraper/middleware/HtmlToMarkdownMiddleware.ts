@@ -1,4 +1,4 @@
-// @ts-ignore
+// @ts-expect-error
 import { gfm } from "@joplin/turndown-plugin-gfm";
 import TurndownService from "turndown";
 import { logger } from "../../utils/logger"; // Added logger
@@ -31,7 +31,7 @@ export class HtmlToMarkdownMiddleware implements ContentProcessorMiddleware {
     // Preserve code blocks and syntax (replicated from HtmlProcessor)
     this.turndownService.addRule("pre", {
       filter: ["pre"],
-      replacement: (content, node) => {
+      replacement: (_content, node) => {
         const element = node as unknown as HTMLElement;
         let language = element.getAttribute("data-language") || "";
         if (!language) {

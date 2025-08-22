@@ -1,4 +1,4 @@
-import { type Mock, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Document } from "../../types";
 import type { ScraperOptions } from "../types";
 import { ScrapeMode } from "../types"; // Import ScrapeMode
@@ -435,7 +435,7 @@ describe("WebScraperStrategy", () => {
     // Check structure of a progress call with a document
     expect(callsWithDocs[0][0]).toMatchObject({
       pagesScraped: expect.any(Number),
-      maxPages: options.maxPages,
+      totalPages: expect.any(Number),
       currentUrl: expect.any(String),
       depth: expect.any(Number),
       maxDepth: options.maxDepth,
@@ -462,18 +462,19 @@ describe("WebScraperStrategy", () => {
   }, 10000);
 
   it("should support scraping for URLs with embedded credentials (user:password@host)", async () => {
-    // Use a Playwright scrapeMode and a URL with credentials
+    // Test that the strategy can handle URLs with embedded credentials
+    // Note: Actual credential extraction and browser auth is tested in HtmlPlaywrightMiddleware.test.ts
+    // This test focuses on the strategy's ability to process such URLs through the pipeline
     const urlWithCreds = "https://user:password@example.com/";
     options.url = urlWithCreds;
-    options.scrapeMode = ScrapeMode.Playwright;
-    const expectedMarkdown = "# Playwright Content";
-    const expectedTitle = "Playwright Test";
+    options.scrapeMode = ScrapeMode.Fetch; // Use fetch mode to avoid Playwright browser operations
+    const expectedMarkdown = "# Processed Content";
+    const expectedTitle = "Test Page";
 
-    // Mock Playwright middleware by patching the pipeline's process method
-    // (Assume HtmlPipeline is used and Playwright middleware is in the chain)
-    // We'll mock the fetch to simulate Playwright output
+    // Mock fetch to simulate content processing
+    // We'll mock the fetch to simulate processed output
     mockFetchFn.mockResolvedValue({
-      content: `<html><head><title>${expectedTitle}</title></head><body><h1>Playwright Content</h1></body></html>`,
+      content: `<html><head><title>${expectedTitle}</title></head><body><h1>Processed Content</h1></body></html>`,
       mimeType: "text/html",
       source: urlWithCreds,
     });
@@ -491,7 +492,7 @@ describe("WebScraperStrategy", () => {
     expect(docCall).toBeDefined();
     expect(docCall![0].document.content).toContain(expectedMarkdown);
     expect(docCall![0].document.metadata.title).toBe(expectedTitle);
-  }, 10000); // Set timeout to 10 seconds for Playwright test
+  }, 10000); // Keep timeout for consistency but test should run quickly with fetch mode
 
   it("should forward custom headers to HttpFetcher", async () => {
     const progressCallback = vi.fn();
@@ -516,5 +517,347 @@ describe("WebScraperStrategy", () => {
         },
       }),
     );
+  });
+
+  describe("pipeline selection", () => {
+    it("should process HTML content through HtmlPipeline", async () => {
+      const progressCallback = vi.fn();
+      const testUrl = "https://example.com";
+      options.url = testUrl;
+
+      mockFetchFn.mockResolvedValue({
+        content:
+          "<html><head><title>HTML Test</title></head><body><h1>HTML Content</h1></body></html>",
+        mimeType: "text/html",
+        source: testUrl,
+      });
+
+      await strategy.scrape(options, progressCallback);
+
+      // Verify HTML content was processed (converted to markdown)
+      const docCall = progressCallback.mock.calls.find((call) => call[0].document);
+      expect(docCall).toBeDefined();
+      expect(docCall![0].document.content).toContain("# HTML Content");
+      expect(docCall![0].document.metadata.title).toBe("HTML Test");
+    });
+
+    it("should process markdown content through MarkdownPipeline", async () => {
+      const progressCallback = vi.fn();
+      const testUrl = "https://example.com/readme.md";
+      options.url = testUrl;
+
+      const markdownContent = "# Markdown Title\n\nThis is already markdown content.";
+      mockFetchFn.mockResolvedValue({
+        content: markdownContent,
+        mimeType: "text/markdown",
+        source: testUrl,
+      });
+
+      await strategy.scrape(options, progressCallback);
+
+      // Verify markdown content was processed
+      const docCall = progressCallback.mock.calls.find((call) => call[0].document);
+      expect(docCall).toBeDefined();
+      expect(docCall![0].document.content).toContain("# Markdown Title");
+      expect(docCall![0].document.content).toContain("This is already markdown content.");
+    });
+
+    it("should skip unsupported content types", async () => {
+      const progressCallback = vi.fn();
+      const testUrl = "https://example.com/image.png";
+      options.url = testUrl;
+
+      mockFetchFn.mockResolvedValue({
+        content: Buffer.from([0x89, 0x50, 0x4e, 0x47]), // PNG header
+        mimeType: "image/png",
+        source: testUrl,
+      });
+
+      await strategy.scrape(options, progressCallback);
+
+      // Verify no document was produced for unsupported content
+      const docCall = progressCallback.mock.calls.find((call) => call[0].document);
+      expect(docCall).toBeUndefined();
+    });
+  });
+
+  describe("error handling", () => {
+    it("should handle fetch failures gracefully", async () => {
+      const progressCallback = vi.fn();
+      const testUrl = "https://example.com/error";
+      options.url = testUrl;
+
+      mockFetchFn.mockRejectedValue(new Error("Network error"));
+
+      // Should throw the error (not swallow it)
+      await expect(strategy.scrape(options, progressCallback)).rejects.toThrow(
+        "Network error",
+      );
+
+      // Verify no documents were processed
+      const docCalls = progressCallback.mock.calls.filter((call) => call[0].document);
+      expect(docCalls).toHaveLength(0);
+    });
+
+    it("should handle empty content gracefully", async () => {
+      const progressCallback = vi.fn();
+      const testUrl = "https://example.com/empty";
+      options.url = testUrl;
+
+      mockFetchFn.mockResolvedValue({
+        content: "<html><body></body></html>", // Empty content
+        mimeType: "text/html",
+        source: testUrl,
+      });
+
+      await strategy.scrape(options, progressCallback);
+
+      // Should complete without error but may not produce useful content
+      // The behavior here depends on the pipeline implementation
+      expect(mockFetchFn).toHaveBeenCalledWith(testUrl, expect.anything());
+    });
+  });
+
+  describe("custom link filtering", () => {
+    it("should use custom shouldFollowLink function when provided", async () => {
+      const customFilter = vi.fn().mockImplementation((_baseUrl: URL, targetUrl: URL) => {
+        // Only follow links containing 'allowed'
+        return targetUrl.pathname.includes("allowed");
+      });
+
+      const customStrategy = new WebScraperStrategy({
+        shouldFollowLink: customFilter,
+      });
+
+      mockFetchFn.mockImplementation(async (url: string) => {
+        if (url === "https://example.com") {
+          return {
+            content: `
+              <html><head><title>Base</title></head><body>
+                <a href="/allowed-page">Allowed Page</a>
+                <a href="/blocked-page">Blocked Page</a>
+                <a href="/also-allowed">Also Allowed</a>
+              </body></html>`,
+            mimeType: "text/html",
+            source: url,
+          };
+        }
+        return {
+          content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+          mimeType: "text/html",
+          source: url,
+        };
+      });
+
+      options.maxDepth = 1;
+      const progressCallback = vi.fn();
+
+      await customStrategy.scrape(options, progressCallback);
+
+      // Verify custom filter was called
+      expect(customFilter).toHaveBeenCalled();
+
+      // Verify only allowed pages were fetched
+      expect(mockFetchFn).toHaveBeenCalledWith("https://example.com", expect.anything());
+      expect(mockFetchFn).toHaveBeenCalledWith(
+        "https://example.com/allowed-page",
+        expect.anything(),
+      );
+      expect(mockFetchFn).toHaveBeenCalledWith(
+        "https://example.com/also-allowed",
+        expect.anything(),
+      );
+      expect(mockFetchFn).not.toHaveBeenCalledWith(
+        "https://example.com/blocked-page",
+        expect.anything(),
+      );
+
+      // Verify documents were produced for allowed pages
+      const receivedDocs = progressCallback.mock.calls
+        .map((call) => call[0].document)
+        .filter((doc): doc is Document => doc !== undefined);
+      expect(receivedDocs).toHaveLength(3); // Base + 2 allowed pages
+    });
+  });
+
+  // Canonical redirect test: relative links resolve against canonical final URL (directory form)
+  it("should resolve relative links against canonical final URL with trailing slash + query", async () => {
+    const original = "https://learn.microsoft.com/en-us/azure/bot-service";
+    const canonical = `${original}/?view=azure-bot-service-4.0`; // What the server redirects to
+    const relHref = "bot-overview?view=azure-bot-service-4.0";
+    const expectedCanonicalFollow =
+      "https://learn.microsoft.com/en-us/azure/bot-service/bot-overview?view=azure-bot-service-4.0";
+
+    // Mock fetch: initial fetch returns HTML with relative link and final canonical source (post-redirect)
+    mockFetchFn.mockImplementation(async (url: string) => {
+      if (url === original) {
+        return {
+          content: `<html><body><a href="${relHref}">Link</a></body></html>`,
+          mimeType: "text/html",
+          source: canonical, // Final URL after redirect
+        };
+      }
+      return {
+        content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+        mimeType: "text/html",
+        source: url,
+      };
+    });
+
+    options.url = original;
+    options.maxDepth = 1;
+    options.maxPages = 5;
+
+    const progressCallback = vi.fn();
+    await strategy.scrape(options, progressCallback);
+
+    expect(mockFetchFn).toHaveBeenCalledWith(original, expect.anything());
+    expect(mockFetchFn).toHaveBeenCalledWith(expectedCanonicalFollow, expect.anything());
+  });
+
+  // Integration: relative resolution from index.html with subpages scope
+  it("should follow nested descendant from index.html (subpages scope) but not upward sibling", async () => {
+    const start = "https://example.com/api/index.html";
+    const nestedRel = "aiq/agent/index.html";
+    const upwardRel = "../shared/index.html";
+    const expectedNested = "https://example.com/api/aiq/agent/index.html";
+    const expectedUpward = "https://example.com/shared/index.html";
+
+    mockFetchFn.mockImplementation(async (url: string) => {
+      if (url === start) {
+        return {
+          content: `<html><body>
+            <a href="${nestedRel}">Nested</a>
+            <a href="${upwardRel}">UpOne</a>
+          </body></html>`,
+          mimeType: "text/html",
+          source: url,
+        };
+      }
+      return {
+        content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+        mimeType: "text/html",
+        source: url,
+      };
+    });
+
+    options.url = start;
+    options.scope = "subpages";
+    options.maxDepth = 1;
+    options.maxPages = 5;
+
+    const progressCallback = vi.fn();
+    await strategy.scrape(options, progressCallback);
+
+    expect(mockFetchFn).toHaveBeenCalledWith(start, expect.anything());
+    expect(mockFetchFn).toHaveBeenCalledWith(expectedNested, expect.anything());
+    expect(mockFetchFn).not.toHaveBeenCalledWith(expectedUpward, expect.anything());
+  });
+
+  // Integration: upward relative allowed with hostname scope
+  it("should follow upward relative link when scope=hostname", async () => {
+    const start = "https://example.com/api/index.html";
+    const nestedRel = "aiq/agent/index.html";
+    const upwardRel = "../shared/index.html";
+    const expectedNested = "https://example.com/api/aiq/agent/index.html";
+    const expectedUpward = "https://example.com/shared/index.html";
+
+    mockFetchFn.mockImplementation(async (url: string) => {
+      if (url === start) {
+        return {
+          content: `<html><body>
+            <a href="${nestedRel}">Nested</a>
+            <a href="${upwardRel}">UpOne</a>
+          </body></html>`,
+          mimeType: "text/html",
+          source: url,
+        };
+      }
+      return {
+        content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+        mimeType: "text/html",
+        source: url,
+      };
+    });
+
+    options.url = start;
+    options.scope = "hostname";
+    options.maxDepth = 1;
+    options.maxPages = 10;
+
+    const progressCallback = vi.fn();
+    await strategy.scrape(options, progressCallback);
+
+    expect(mockFetchFn).toHaveBeenCalledWith(start, expect.anything());
+    expect(mockFetchFn).toHaveBeenCalledWith(expectedNested, expect.anything());
+    expect(mockFetchFn).toHaveBeenCalledWith(expectedUpward, expect.anything());
+  });
+
+  // Integration: directory base parity
+  it("should treat directory base and index.html base equivalently for nested descendant", async () => {
+    const startDir = "https://example.com/api/";
+    const nestedRel = "aiq/agent/index.html";
+    const expectedNested = "https://example.com/api/aiq/agent/index.html";
+
+    mockFetchFn.mockImplementation(async (url: string) => {
+      if (url === startDir) {
+        return {
+          content: `<html><body><a href="${nestedRel}">Nested</a></body></html>`,
+          mimeType: "text/html",
+          source: url,
+        };
+      }
+      return {
+        content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+        mimeType: "text/html",
+        source: url,
+      };
+    });
+
+    options.url = startDir;
+    options.scope = "subpages";
+    options.maxDepth = 1;
+    options.maxPages = 5;
+
+    const progressCallback = vi.fn();
+    await strategy.scrape(options, progressCallback);
+
+    expect(mockFetchFn).toHaveBeenCalledWith(startDir, expect.anything());
+    expect(mockFetchFn).toHaveBeenCalledWith(expectedNested, expect.anything());
+  });
+
+  it("should not enqueue cross-origin links introduced via <base href> when scope=subpages", async () => {
+    const start = "https://example.com/app/index.html";
+    const cdnBase = "https://cdn.example.com/lib/";
+    const relLink = "script.js";
+    const resolved = `${cdnBase}${relLink}`;
+
+    mockFetchFn.mockImplementation(async (url: string) => {
+      if (url === start) {
+        return {
+          content: `<html><head><base href="${cdnBase}"></head><body><a href="${relLink}">Script</a></body></html>`,
+          mimeType: "text/html",
+          source: url,
+        };
+      }
+      // Any unexpected fetches return generic content
+      return {
+        content: `<html><head><title>${url}</title></head><body>${url}</body></html>`,
+        mimeType: "text/html",
+        source: url,
+      };
+    });
+
+    options.url = start;
+    options.scope = "subpages";
+    options.maxDepth = 1;
+    options.maxPages = 5;
+
+    const progressCallback = vi.fn();
+    await strategy.scrape(options, progressCallback);
+
+    // Should fetch only the start page; the cross-origin (different hostname) base-derived link is filtered out
+    expect(mockFetchFn).toHaveBeenCalledWith(start, expect.anything());
+    expect(mockFetchFn).not.toHaveBeenCalledWith(resolved, expect.anything());
   });
 });

@@ -174,4 +174,196 @@ describe("HtmlLinkExtractorMiddleware", () => {
     expect(context.errors[0].message).toContain("Failed to extract links from HTML");
     expect(context.errors[0].message).toContain(errorMsg);
   });
+
+  it("should resolve mixed relative links with queries, hashes, and handle duplicates/protocols", async () => {
+    const middleware = new HtmlLinkExtractorMiddleware();
+    const sourceUrl = "http://example.com/docs/sub/page.html";
+    const html = `
+      <html><body>
+        <a href="http://external.com/page">Abs</a>
+        <a href="example-a?view=page1">Rel+Q</a>
+        <a href="/example-a?view=page1">Root+Q</a>
+        <a href="../example-a?view=page1">Parent+Q</a>
+        <a href="?view=page1">QueryOnly</a>
+        <a href="#section1">HashOnly</a>
+        <a href="example-a?view=abc#frag">Rel+Q+Hash</a>
+        <a href="example-a?view=a">DupA</a>
+        <a href="example-a?view=b">DupB</a>
+        <a href="example-a?view=a">DupARepeat</a>
+        <a href="javascript:void(0)">JS</a>
+        <a href="mailto:user@example.com?subject=Hi">Mail</a>
+        <a href="test%2Dabc?view=test%2Dabc">Encoded</a>
+        <a href="../example-a?view=zzz#h">Parent+Q+Hash</a>
+        <a href="HTTP://external.com/UP">UpperProto</a>
+        <a href="example-a.html?view=page1">HtmlExt</a>
+      </body></html>`;
+    const context = createMockContext(html, sourceUrl);
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await middleware.process(context, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    const expected = [
+      "http://external.com/page",
+      "http://example.com/docs/sub/example-a?view=page1",
+      "http://example.com/example-a?view=page1",
+      "http://example.com/docs/example-a?view=page1",
+      "http://example.com/docs/sub/page.html?view=page1",
+      "http://example.com/docs/sub/page.html#section1",
+      "http://example.com/docs/sub/example-a?view=abc#frag",
+      "http://example.com/docs/sub/example-a?view=a",
+      "http://example.com/docs/sub/example-a?view=b",
+      "http://example.com/docs/sub/test%2Dabc?view=test%2Dabc",
+      "http://example.com/docs/example-a?view=zzz#h",
+      "http://external.com/UP",
+      "http://example.com/docs/sub/example-a.html?view=page1",
+    ];
+    expect(context.links).toEqual(expected);
+    expect(context.links.some((l) => l.startsWith("javascript:"))).toBe(false);
+    expect(context.links.some((l) => l.startsWith("mailto:"))).toBe(false);
+    expect(context.errors).toHaveLength(0);
+  });
+
+  describe("relative resolution from file base (index.html)", () => {
+    it("should resolve links relative to the file's parent directory", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/api/index.html";
+      const html = `
+        <html><body>
+          <a href="aiq/agent/index.html">Nested</a>
+          <a href="../shared/index.html">UpOne</a>
+          <a href="?q=1">QuerySame</a>
+          <a href="#top">HashSame</a>
+        </body></html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      expect(context.links).toEqual([
+        "http://example.com/api/aiq/agent/index.html",
+        "http://example.com/shared/index.html",
+        "http://example.com/api/index.html?q=1",
+        "http://example.com/api/index.html#top",
+      ]);
+    });
+  });
+
+  describe("relative resolution from directory base (trailing slash)", () => {
+    it("should resolve links relative to the directory itself", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/api/"; // directory form
+      const html = `
+        <html><body>
+          <a href="aiq/agent/index.html">Nested</a>
+          <a href="../shared/index.html">UpOne</a>
+          <a href="?q=1">QueryDir</a>
+          <a href="#top">HashDir</a>
+        </body></html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      expect(context.links).toEqual([
+        "http://example.com/api/aiq/agent/index.html",
+        "http://example.com/shared/index.html",
+        "http://example.com/api/?q=1",
+        "http://example.com/api/#top",
+      ]);
+    });
+  });
+
+  describe("base tag handling", () => {
+    it("resolves relative links using relative base path", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/site/section/page.html";
+      const html = `
+        <html>
+          <head><base href="../assets/"></head>
+          <body>
+            <a href="img/logo.png">Logo</a>
+          </body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["http://example.com/site/assets/img/logo.png"]);
+    });
+
+    it("resolves links with absolute cross-origin base", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/app/index.html";
+      const html = `
+        <html>
+          <head><base href="https://cdn.example.com/lib/"></head>
+          <body><a href="script.js">Script</a></body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["https://cdn.example.com/lib/script.js"]);
+    });
+
+    it("supports protocol-relative base", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/app/index.html";
+      const html = `
+        <html>
+          <head><base href="//cdn.example.com/lib/"></head>
+          <body><a href="style.css">Style</a></body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["http://cdn.example.com/lib/style.css"]);
+    });
+
+    it("uses only the first base tag when multiple present", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/base/test.html";
+      const html = `
+        <html>
+          <head>
+            <base href="/one/">
+            <base href="/two/">
+          </head>
+          <body><a href="a">A</a></body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["http://example.com/one/a"]);
+    });
+
+    it("falls back to page URL on invalid base", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/path/page.html";
+      const html = `
+        <html>
+          <head><base href=":bad:://"></head>
+          <body><a href="rel">Rel</a></body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["http://example.com/path/rel"]);
+    });
+
+    it("handles directory page with relative base", async () => {
+      const middleware = new HtmlLinkExtractorMiddleware();
+      const sourceUrl = "http://example.com/docs/"; // directory form
+      const html = `
+        <html>
+          <head><base href="subdir/"></head>
+          <body><a href="a">A</a></body>
+        </html>`;
+      const context = createMockContext(html, sourceUrl);
+      const next = vi.fn().mockResolvedValue(undefined);
+      await middleware.process(context, next);
+      expect(context.links).toEqual(["http://example.com/docs/subdir/a"]);
+    });
+  });
 });

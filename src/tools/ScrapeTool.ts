@@ -1,8 +1,6 @@
 import * as semver from "semver";
-import type { PipelineManager } from "../pipeline/PipelineManager";
+import type { IPipeline } from "../pipeline/trpc/interfaces";
 import { ScrapeMode } from "../scraper/types";
-import type { DocumentManagementService } from "../store/DocumentManagementService";
-import type { ProgressResponse } from "../types";
 import {
   DEFAULT_MAX_CONCURRENCY,
   DEFAULT_MAX_DEPTH,
@@ -47,6 +45,8 @@ export interface ScrapeToolOptions {
     includePatterns?: string[];
     /**
      * Patterns for excluding URLs during scraping. Exclude takes precedence over include.
+     * If not specified, default patterns exclude common files (CHANGELOG.md, LICENSE, etc.)
+     * and folders (archive, deprecated, i18n locales, etc.).
      * Regex patterns must be wrapped in slashes, e.g. /pattern/.
      */
     excludePatterns?: string[];
@@ -69,16 +69,13 @@ export interface ScrapeResult {
 export type ScrapeExecuteResult = ScrapeResult | { jobId: string };
 
 /**
- * Tool for enqueuing documentation scraping jobs via the PipelineManager.
+ * Tool for enqueuing documentation scraping jobs via the pipeline.
  */
 export class ScrapeTool {
-  private docService: DocumentManagementService;
-  private manager: PipelineManager; // Add manager property
+  private pipeline: IPipeline;
 
-  constructor(docService: DocumentManagementService, manager: PipelineManager) {
-    // Add manager to constructor
-    this.docService = docService;
-    this.manager = manager; // Store manager instance
+  constructor(pipeline: IPipeline) {
+    this.pipeline = pipeline;
   }
 
   async execute(options: ScrapeToolOptions): Promise<ScrapeExecuteResult> {
@@ -119,23 +116,20 @@ export class ScrapeTool {
 
     internalVersion = internalVersion.toLowerCase();
 
-    // Remove any existing documents for this library/version
-    await this.docService.removeAllDocuments(library, internalVersion);
-    logger.info(
-      `💾 Cleared store for ${library}@${internalVersion || "[no version]"} before scraping.`,
-    );
-
-    // Use the injected manager instance
-    const manager = this.manager;
+    // Use the injected pipeline instance
+    const pipeline = this.pipeline;
 
     // Remove internal progress tracking and callbacks
     // let pagesScraped = 0;
     // let lastReportedPages = 0;
     // const reportProgress = ...
-    // manager.setCallbacks(...)
+    // pipeline.setCallbacks(...)
 
-    // Enqueue the job using the injected manager
-    const jobId = await manager.enqueueJob(library, internalVersion, {
+    // Normalize pipeline version argument: use null for unversioned to be explicit cross-platform
+    const enqueueVersion: string | null = internalVersion === "" ? null : internalVersion;
+
+    // Enqueue the job using the injected pipeline
+    const jobId = await pipeline.enqueueJob(library, enqueueVersion, {
       url: url,
       library: library,
       version: internalVersion,
@@ -154,9 +148,9 @@ export class ScrapeTool {
     // Conditionally wait for completion
     if (waitForCompletion) {
       try {
-        await manager.waitForJobCompletion(jobId);
+        await pipeline.waitForJobCompletion(jobId);
         // Fetch final job state to get status and potentially final page count
-        const finalJob = await manager.getJob(jobId);
+        const finalJob = await pipeline.getJob(jobId);
         const finalPagesScraped = finalJob?.progress?.pagesScraped ?? 0; // Get count from final job state
         logger.debug(
           `Job ${jobId} finished with status ${finalJob?.status}. Pages scraped: ${finalPagesScraped}`,
@@ -168,7 +162,7 @@ export class ScrapeTool {
         logger.error(`❌ Job ${jobId} failed or was cancelled: ${error}`);
         throw error; // Re-throw so the caller knows it failed
       }
-      // No finally block needed to stop manager, as it's managed externally
+      // No finally block needed to stop pipeline, as it's managed externally
     }
 
     // If not waiting, return the job ID immediately

@@ -1,9 +1,16 @@
 {
-  "$schema": "https://biomejs.dev/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.1.3/schema.json",
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
   "formatter": {
     "enabled": true,
     "formatWithErrors": false,
-    "ignore": [],
+    "includes": ["**"],
     "attributePosition": "auto",
     "indentStyle": "space",
     "indentWidth": 2,
@@ -11,15 +18,18 @@
     "lineEnding": "lf"
   },
   "files": {
-    "include": ["src/**/*.ts"]
+    "includes": ["**/src/**/*.ts"]
   },
   "overrides": [
     {
-      "include": ["src/**/*.test.ts"],
+      "includes": ["**/src/**/*.test.ts"],
       "linter": {
         "rules": {
           "style": {
             "noNonNullAssertion": "off"
+          },
+          "suspicious": {
+            "noExplicitAny": "off"
           }
         }
       }
